@@ -1,0 +1,8 @@
+{
+  "name": "mocha-fixture-esm",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "mocha": "^11.7.5"
+  }
+}

@@ -1,3 +1,59 @@
+# Mocha Dagger Toolchain
+
+## Installation
+
+```
+dagger toolchain install github.com/dagger/mochajs
+```
+
+## Functions
+
+- `projects`: List the Mocha projects visible from the current directory
+- `testAll`: Execute the tests of every visible project (the automatic check)
+- `test`: Execute the tests of a single project
+- `list`: List the tests of a single project
+
+## Project discovery
+
+Discovery is anchored at the directory you run Dagger from, not at the workspace
+root: `dagger check` tests the project you are in and the projects beneath it. A
+project is any directory holding a `.mocharc.*` file (`node_modules` excluded); a
+`mocha` key in `package.json` also configures Mocha, but `package.json` marks
+every npm package, so it is not a discovery marker.
+
+```bash
+# from the workspace root of a monorepo holding a/ and b/
+dagger call mochajs projects   # -> a, b
+
+# from a/
+dagger call mochajs projects   # -> .
+```
+
+A directory holding no config of its own sits inside its enclosing project, so
+that project is reported as a `..`-relative path and runs too. To run a single
+project, enter it.
+
+## Customization
+
+The toolchain can be customized in your `dagger.toml` to meet your needs:
+
+```toml
+[modules.mochajs]
+source = "github.com/dagger/mochajs"
+
+# default: node:25-alpine; use any container image
+settings.baseImageAddress = "node:22"
+
+# default: npm; alternatively use yarn, pnpm, or bun
+settings.packageManager = "yarn"
+```
+
+Per-run options (`--build`, `--files`, `--flags`) are passed on the command line:
+
+```bash
+dagger call mochajs test --build --flags=--bail
+```
+
 # @dagger.io/mocha
 
 Auto-instrumentation for Mocha tests with OpenTelemetry. It creates spans for:

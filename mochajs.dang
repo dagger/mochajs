@@ -1,0 +1,171 @@
+"""
+Toolchain to execute Mocha tests
+"""
+type Mochajs {
+  """
+  The base image to use.
+  """
+  pub baseImageAddress: String! = "node:25-alpine"
+
+  """
+  The package manager to use.
+  """
+  pub packageManager: String! = "npm"
+
+  """
+  Filenames that mark a Mocha project. A `mocha` key in package.json also
+  configures Mocha, but package.json marks every npm package, so it is not a
+  discovery marker.
+  """
+  let configNames: [String!]! = [
+    ".mocharc.js",
+    ".mocharc.cjs",
+    ".mocharc.mjs",
+    ".mocharc.json",
+    ".mocharc.jsonc",
+    ".mocharc.yaml",
+    ".mocharc.yml",
+  ]
+
+  """
+  The Mocha projects visible from the client's cwd: every project at or below
+  it, plus the nearest enclosing project when the cwd holds no config of its
+  own. Paths are cwd-relative, so a ".." prefix marks an enclosing project.
+  """
+  pub projects(ws: Workspace!): [String!]! {
+    polyfill().workspace(ws).findConfigDirs(
+      configNames,
+      exclude: ["**/node_modules/**"],
+    )
+  }
+
+  """
+  Execute the tests of every project visible from the client's cwd. A cwd that
+  holds no config of its own sits inside its enclosing project, so that project
+  runs too; enter a subproject to run it alone.
+  """
+  pub testAll(
+    ws: Workspace!,
+    """
+    Run build before test
+    """
+    build: Boolean! = false,
+    """
+    Flags to pass to mocha
+    """
+    flags: [String!]! = [],
+  ): Void @check {
+    projects(ws).each { path => test(ws, path: path, build: build, flags: flags) }
+
+    null
+  }
+
+  """
+  Execute the tests of a single project
+  """
+  pub test(
+    ws: Workspace!,
+    """
+    Path of the project to test, relative to the client's cwd
+    """
+    path: String! = ".",
+    """
+    List of files to test
+    """
+    files: [String!]! = [],
+    """
+    Run build before test
+    """
+    build: Boolean! = false,
+    """
+    Flags to pass to mocha
+    """
+    flags: [String!]! = [],
+  ): Void {
+    let src = source(ws, path: path)
+    let n = nodejs(src, baseImageAddress, packageManager)
+    let runtime = n.base
+
+    # optionally build first
+    if (build) {
+      runtime = runtime.withExec([packageManager, "run", "build"])
+    }
+
+    # install the local build of the otel library
+    runtime = n.withInstallLocalPackage(runtime, buildLibrary)
+
+    # Node resolves the register file through the package exports, and a
+    # CommonJS project can only preload the CommonJS one.
+    let packageType = container
+      .from("alpine:3")
+      .withExec(["apk", "add", "jq"])
+      .withFile("/package.json", src.file("package.json"))
+      .withExec(["jq", ".type", "/package.json"])
+      .stdout
+
+    let opts = "$NODE_OPTIONS --import @dagger.io/mocha/register "
+    if (packageType.contains("commonjs")) {
+      opts = "$NODE_OPTIONS --require @dagger.io/mocha/register "
+    }
+
+    # mount and install the otel library and then execute the tests
+    runtime
+      .withEnvVariable("NODE_OPTIONS", opts, expand: true)
+      .withEnvVariable("DAGGER_MOCHA_CACHE_BUSTER", UUID.v7)
+      .withExec(["npx", "mocha"] + flags + files)
+      .sync
+
+    null
+  }
+
+  """
+  List the tests of a single project
+  """
+  pub list(
+    ws: Workspace!,
+    """
+    Path of the project to list, relative to the client's cwd
+    """
+    path: String! = ".",
+  ): String! {
+    let cmd = ["npx", "mocha", "--dry-run"]
+
+    nodejs(source(ws, path: path), baseImageAddress, packageManager)
+      .base
+      .withExec(cmd)
+      .stdout
+  }
+
+  """
+  The source directory of a project, relative to the client's cwd
+  """
+  pub source(
+    ws: Workspace!,
+    """
+    Path of the project, relative to the client's cwd
+    """
+    path: String! = ".",
+  ): Directory! {
+    ws.directory(path, exclude: ["**/node_modules", "dist", "build"])
+  }
+
+  """
+  Build the otel library
+  """
+  let buildLibrary: Directory! {
+    # `tests` holds vendored checkouts that dwarf the library itself
+    let module = currentModule.source.filter(
+      exclude: ["tests", ".dagger", "dist", "node_modules", "mochajs.dang"],
+    )
+
+    container
+      .from("oven/bun:1.3.0-alpine@sha256:37e6b1cbe053939bccf6ae4507977ed957eaa6e7f275670b72ad6348e0d2c11f")
+      .withMountedCache("/root/.bun/install/cache", cacheVolume("library-node-modules"))
+      .withEnvVariable("BUN_INSTALL_CACHE_DIR", "/root/.bun/install/cache")
+      .withDirectory("/src", module)
+      .withWorkdir("/src")
+      .withExec(["bun", "install"])
+      .withExec(["bun", "run", "build"])
+      .directory("/src")
+  }
+}

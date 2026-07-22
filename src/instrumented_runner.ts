@@ -1,9 +1,8 @@
 import { OtelSDK } from "@dagger.io/telemetry";
-import { SpanStatusCode, context, trace } from "@opentelemetry/api";
-import { Runner } from "mocha";
-
-import type { Span, Context } from "@opentelemetry/api";
+import type { Context, Span } from "@opentelemetry/api";
+import { context, SpanStatusCode, trace } from "@opentelemetry/api";
 import type { RunnerOptions, Suite, Test } from "mocha";
+import { Runner } from "mocha";
 
 const tracer = trace.getTracer("dagger.io/mocha");
 

@@ -1,0 +1,225 @@
+"""
+End-to-end checks for the mochajs toolchain.
+
+Each check drives the installed `mochajs` dependency against the sample projects
+under `.dagger/modules/e2e/modules`, plus throwaway in-memory workspaces for the
+discovery and cwd-scope paths. Run them with `dagger check`.
+"""
+type E2E {
+  """
+  The CommonJS sample project, also used as the building block of the synthetic
+  multi-project workspaces below. Its `spec` is scoped to its own `test`
+  directory, so a copy nested inside another copy is not swept up by its parent.
+  """
+  let cjsProject: Directory! {
+    currentModule.source.directory("modules/cjs")
+  }
+
+  """
+  The ESM sample project. Mocha is preloaded through a different Node flag for
+  ESM than for CommonJS, so both are run end-to-end.
+  """
+  let esmProject: Directory! {
+    currentModule.source.directory("modules/esm")
+  }
+
+  """
+  Run the toolchain against the sample projects, exercising the real thing:
+  discovery, the local build of the otel library, and a Mocha run under both
+  module systems.
+  """
+  pub sampleProjectsCheck: Void @check {
+    mochajs().testAll(cjsProject.asWorkspace)
+    mochajs().testAll(esmProject.asWorkspace)
+
+    null
+  }
+
+  """
+  `list` reports the tests a project would run without running them.
+  """
+  pub listCheck: Void @check {
+    let listed = mochajs().list(cjsProject.asWorkspace)
+
+    if (listed.contains("nested suite") == false) {
+      raise "list did not report the fixture's tests: " + listed
+    }
+
+    null
+  }
+
+  """
+  Every Mocha config filename is a dotfile, so discovery only works if the glob
+  matches hidden files. One project per supported name, all discovered.
+  """
+  pub configNameDiscoveryCheck: Void @check {
+    let tree = directory.
+      withNewFile("js/.mocharc.js", "module.exports = {};\n").
+      withNewFile("cjs/.mocharc.cjs", "module.exports = {};\n").
+      withNewFile("mjs/.mocharc.mjs", "export default {};\n").
+      withNewFile("json/.mocharc.json", "{}\n").
+      withNewFile("jsonc/.mocharc.jsonc", "{}\n").
+      withNewFile("yaml/.mocharc.yaml", "{}\n").
+      withNewFile("yml/.mocharc.yml", "{}\n")
+
+    assertPaths(
+      mochajs().projects(tree.asWorkspace),
+      ["js", "cjs", "mjs", "json", "jsonc", "yaml", "yml"],
+      "one project per config filename",
+    )
+
+    null
+  }
+
+  """
+  Two sibling projects under a root that holds no config of its own:
+
+      a/.mocharc.json
+      b/.mocharc.json
+  """
+  let siblings: Directory! {
+    directory.
+      withDirectory("a", cjsProject).
+      withDirectory("b", cjsProject)
+  }
+
+  """
+  A root project with a project nested under each of two subdirectories:
+
+      .mocharc.json
+      a/.mocharc.json
+      b/.mocharc.json
+  """
+  let nested: Directory! {
+    cjsProject.
+      withDirectory("a", cjsProject).
+      withDirectory("b", cjsProject)
+  }
+
+  """
+  A root project with a nested project under a subdirectory holding no config
+  of its own:
+
+      .mocharc.json
+      work/                  <- no config
+      work/app/.mocharc.json
+  """
+  let ancestor: Directory! {
+    cjsProject.withDirectory("work/app", cjsProject)
+  }
+
+  """
+  Discovery from `cwd` inside a synthetic workspace built from `tree`.
+  """
+  let projects(tree: Directory!, cwd: String!): [String!]! {
+    mochajs().projects(tree.asWorkspace(cwd: cwd))
+  }
+
+  """
+  Fail unless discovery returned exactly the wanted paths, in any order.
+  """
+  let assertPaths(got: [String!]!, want: [String!]!, context: String!): Void {
+    let rendered = context + ": got [" + got.join(", ") + "], want [" + want.join(", ") + "]"
+
+    if (got.length != want.length) {
+      raise rendered
+    }
+    want.each { path =>
+      if (got.filter { value => value == path }.length != 1) {
+        raise rendered
+      }
+    }
+    null
+  }
+
+  """
+  From a root holding no config, discovery returns every project beneath it;
+  entering one of them scopes discovery to that project alone.
+  """
+  pub siblingDiscoveryCheck: Void @check {
+    assertPaths(projects(siblings, "."), ["a", "b"], "from the workspace root")
+    assertPaths(projects(siblings, "a"), ["."], "from a")
+    assertPaths(projects(siblings, "b"), ["."], "from b")
+
+    null
+  }
+
+  """
+  A root project does not leak into a nested project's view: the config in the
+  cwd shadows the enclosing one, so entering `a` yields `a` alone.
+  """
+  pub nestedDiscoveryCheck: Void @check {
+    assertPaths(projects(nested, "."), [".", "a", "b"], "from the workspace root")
+    assertPaths(projects(nested, "a"), ["."], "from a")
+    assertPaths(projects(nested, "b"), ["."], "from b")
+
+    null
+  }
+
+  """
+  From a subdirectory holding no config, the nearest enclosing project is
+  reported as a ".."-relative path alongside the projects below the cwd, and
+  that path resolves back to the enclosing project through the workspace.
+  """
+  pub ancestorDiscoveryCheck: Void @check {
+    let ws = ancestor.asWorkspace(cwd: "work")
+
+    assertPaths(mochajs().projects(ws), ["..", "app"], "from work")
+
+    if (ws.directory("..").glob(".mocharc.json").length != 1) {
+      raise "the returned ancestor path did not resolve back to the enclosing project"
+    }
+
+    null
+  }
+
+  """
+  A failing test file, used to observe which projects a run actually covered.
+  """
+  let failingTest: String! =
+    "const assert = require(\"node:assert\");\n\ndescribe(\"broken\", () => {\n  it(\"fails\", () => {\n    assert.equal(1, 2);\n  });\n});\n"
+
+  """
+  Whether `testAll` from `cwd` observed the failure planted in `tree`.
+  """
+  let testAllFailed(tree: Directory!, cwd: String!): Boolean! {
+    try {
+      mochajs().testAll(tree.asWorkspace(cwd: cwd))
+      false
+    } catch {
+      err => true
+    }
+  }
+
+  """
+  `testAll` runs every project below the cwd, and entering one of them leaves
+  its siblings out of reach.
+  """
+  pub descendantScopeCheck: Void @check {
+    let broken = siblings.withNewFile("b/test/broken.test.js", failingTest)
+
+    if (testAllFailed(broken, ".") == false) {
+      raise "testAll from the workspace root should have run the project b"
+    }
+    if (testAllFailed(broken, "a")) {
+      raise "testAll from a should not have run the sibling project b"
+    }
+    if (testAllFailed(siblings.withNewFile("a/test/broken.test.js", failingTest), "a") == false) {
+      raise "testAll from a should have run a's own tests"
+    }
+
+    null
+  }
+
+  """
+  A cwd holding no config sits inside its enclosing project, so `testAll` runs
+  that project too rather than only the ones below the cwd.
+  """
+  pub ancestorScopeCheck: Void @check {
+    if (testAllFailed(ancestor.withNewFile("test/broken.test.js", failingTest), "work") == false) {
+      raise "testAll from work should have run the enclosing project"
+    }
+
+    null
+  }
+}

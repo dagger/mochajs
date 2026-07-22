@@ -1,0 +1,8 @@
+{
+  "name": "mocha-fixture-cjs",
+  "private": true,
+  "type": "commonjs",
+  "devDependencies": {
+    "mocha": "^11.7.5"
+  }
+}

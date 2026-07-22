@@ -1,0 +1,15 @@
+name = "mochajs"
+engineVersion = "v1.0.0-beta.7"
+
+[runtime]
+  source = "dang"
+
+[[dependencies]]
+  name = "nodejs"
+  source = "github.com/dagger/node@main"
+  pin = "88bcb3525b0ed015d13c08bc7c27570d5453dc65"
+
+[[dependencies]]
+  name = "polyfill"
+  source = "github.com/dagger/polyfill@main"
+  pin = "e90bbfc4843258a877a3a95b8db1571e7981e65f"

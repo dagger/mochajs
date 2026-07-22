@@ -36,11 +36,7 @@ function patchMocha(mochaExports: any) {
 new Hook(["mocha"], { internals: true }, (exports: any, name: string) => {
   try {
     // Hook the main mocha export OR the mocha.js internal file
-    if (
-      name === "mocha" ||
-      name.endsWith("/mocha.js") ||
-      name.endsWith("/lib/mocha")
-    ) {
+    if (name === "mocha" || name.endsWith("/mocha.js") || name.endsWith("/lib/mocha")) {
       return patchMocha(exports);
     }
     return exports;

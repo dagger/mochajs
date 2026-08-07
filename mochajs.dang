@@ -33,7 +33,7 @@ type Mochajs {
   own. Paths are cwd-relative, so a ".." prefix marks an enclosing project.
   """
   pub projects(ws: Workspace!): [String!]! {
-    polyfill().workspace(ws).findConfigDirs(
+    ws.findConfigDirs(
       configNames,
       exclude: ["**/node_modules/**"],
     )

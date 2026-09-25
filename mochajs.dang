@@ -41,25 +41,19 @@ type Mochajs {
   Mocha projects visible from the working directory, keyed by project root.
   """
   projects(ws: Workspace!): MochajsProjects! {
-    MochajsProjects(paths: sorted(projectRoots(ws, "")), tool: self)
+    MochajsProjects(paths: sorted(projectRoots(ws)), tool: self)
   }
 
   """
-  Workspace-root-relative roots of the Mocha projects found from `start`: every
-  project at or below it, plus the nearest enclosing project when `start` holds
-  no config of its own. An empty `start` is the caller's cwd.
+  Workspace-root-relative roots of the Mocha projects visible from the cwd:
+  every project at or below it, plus the nearest enclosing project when the
+  cwd is not a project root itself.
   """
-  let projectRoots(ws: Workspace!, start: String!): [String!]! {
-    let found = if (start == "") {
-      ws.findRoots(markers: configNames, exclude: ["**/node_modules/**"])
-    } else {
-      ws.findRoots(
-        start: start,
-        markers: configNames,
-        exclude: ["**/node_modules/**"],
-      )
-    }
-    found.map { dir => workspaceRootPath(ws, dir) }.uniq
+  let projectRoots(ws: Workspace!): [String!]! {
+    ws
+      .findRoots(markers: configNames, exclude: ["**/node_modules/**"])
+      .map { dir => workspaceRootPath(ws, dir) }
+      .uniq
   }
 
   """
@@ -205,8 +199,7 @@ type MochajsProject {
   }
 
   """
-  Prefix turning a project-relative path into a workspace-root-relative one,
-  the form Workspace.glob matches.
+  Prefix turning a project-relative path into a workspace-root-relative one.
   """
   let globPrefix: String! {
     if (path == ".") { "" } else { path + "/" }
@@ -300,89 +293,80 @@ type MochajsProject {
     }
   }
 
-  # Test files are found by globbing the workspace rather than asking Mocha,
-  # so listing them runs no container. Only what Mocha reads from a JSON or
-  # YAML config is followed: a JS config is not evaluated, the `mocha` key of
-  # package.json and the `ignore` option are not read, and a project whose
-  # config cannot be read statically is assumed to use Mocha's defaults.
+  # Test files are found with one ripgrep search over the project, rather than
+  # by asking Mocha, so listing them runs no container and never walks
+  # node_modules. Only what Mocha reads from a JSON or YAML config is followed:
+  # a JS config is not evaluated, the `mocha` key of package.json and the
+  # `ignore` option are not read, and a project whose config cannot be read
+  # statically is assumed to use Mocha's defaults. Empty files, which hold no
+  # tests, are not listed.
   let testFiles(ws: Workspace!): [String!]! {
     let text = configText(ws)
     let specs = if (text == null) { null } else { specOption(text ?? "") }
     let extensions = if (text == null) { null } else { extensionOption(text ?? "") }
     let recursive = if (text == null) { false } else { recursiveOption(text ?? "") }
-    let nested = tool
-      .projectRoots(ws, absolutePath)
-      .filter { root => root != path and (path == "." or root.hasPrefix(globPrefix)) }
     let empty: [String!]! = []
-    let found = (specs ?? ["./test"]).reduce(empty) { acc, spec =>
-      acc + specFiles(ws, spec, extensions ?? ["js", "cjs", "mjs"], recursive)
+    let globs = (specs ?? ["./test"]).reduce(empty) { acc, spec =>
+      acc + specGlobs(spec, extensions ?? ["js", "cjs", "mjs"], recursive)
     }
-    tool.sorted(
-      found
-        .filter { file =>
-          ("/" + file).contains("/node_modules/") == false
-            and nested.any { root => (globPrefix + file).hasPrefix(root + "/") } == false
-        }
-        .uniq,
-    )
-  }
-
-  """
-  Project-relative files matched by one spec entry. A glob matches files; a
-  plain path names a file, or a directory whose files with the given
-  extensions it holds (at any depth when recursive), as Mocha reads it.
-  """
-  let specFiles(
-    ws: Workspace!,
-    spec: String!,
-    extensions: [String!]!,
-    recursive: Boolean!,
-  ): [String!]! {
-    let empty: [String!]! = []
-    let relative = spec.trimPrefix("./").trimSuffix("/")
-    if (relative == "" or relative.hasPrefix("/") or relative.hasPrefix("..")) {
-      # Outside the project: not a key it can offer.
+    if (globs.length == 0) {
       empty
     } else {
-      expandBraces(relative).reduce(empty) { acc, pattern =>
-        let matches = globFiles(ws, pattern)
-        if (pattern.containsMatch(`[*?\[]`)) {
-          acc + matches.filter { m => m.hasSuffix("/") == false }
-        } else if (matches.contains(pattern + "/")) {
-          let exts = extensions.map { ext => "." + ext.trimPrefix(".") }
-          let depth = if (recursive) { "/**" } else { "/*" }
-          acc + globFiles(ws, pattern + depth)
-            .filter { m => exts.any { ext => m.hasSuffix(ext) } }
-        } else {
-          acc + matches.filter { m => m == pattern }
-        }
+      # The same search finds the configs of nested projects, whose files are
+      # theirs rather than this project's.
+      let found = ws.search(
+        paths: [absolutePath],
+        globs: globs + ["/" + globPrefix + "**/.mocharc.*", "!node_modules", "!.git"],
+        pattern: "",
+        filesOnly: true,
+      ).{{filePath}}.map { match =>
+        match.filePath.trimPrefix("/").trimPrefix("./").trimPrefix(globPrefix)
       }
+      let nested = found
+        .filter { file => file.contains("/") and isConfigFile(file) }
+        .map { file => file.split("/").dropLast(1).join("/") + "/" }
+      tool.sorted(
+        found
+          .filter { file =>
+            isConfigFile(file) == false and nested.any { root => file.hasPrefix(root) } == false
+          }
+          .uniq,
+      )
     }
   }
 
   """
-  Workspace glob of a project-relative pattern, as project-relative paths.
-  Directories keep a trailing slash.
+  Whether a project-relative file is a Mocha config.
   """
-  let globFiles(ws: Workspace!, pattern: String!): [String!]! {
-    ws.glob(globPrefix + pattern).map { m =>
-      m.trimPrefix("/").trimPrefix("./").trimPrefix(globPrefix)
-    }
+  let isConfigFile(file: String!): Boolean! {
+    tool.configNames.any { name => file == name or file.hasSuffix("/" + name) }
   }
 
   """
-  A glob with its brace alternatives spelled out, which Workspace.glob does
-  not expand: "test/*.{js,ts}" is "test/*.js" and "test/*.ts".
+  Root-anchored search globs for one spec entry, as Mocha reads it: a glob
+  matches files, and a plain path names a file, the same path with one of the
+  extensions, or a directory whose files with those extensions it holds (at any
+  depth when recursive). Entries outside the project match nothing.
   """
-  let expandBraces(pattern: String!): [String!]! {
-    let group = pattern.match(`\{([^{}]*)\}`)
-    if (group == null) {
-      [pattern]
+  let specGlobs(spec: String!, extensions: [String!]!, recursive: Boolean!): [String!]! {
+    let relative = spec.trimPrefix("./").trimSuffix("/")
+    let empty: [String!]! = []
+    if (relative.hasPrefix("/") or relative == ".." or relative.hasPrefix("../")) {
+      empty
     } else {
-      let around = pattern.splitMatches(`\{[^{}]*\}`, limit: 2)
-      let empty: [String!]! = []
-      (group.captures ?? empty).takeFirst(1).join("").split(",").reduce(empty) { acc, alt =>
-        acc + expandBraces(around.takeFirst(1).join("") + alt + around.dropFirst(1).join(""))
+      let local = if (relative == "." or relative == "") { "" } else { relative }
+      let base = "/" + globPrefix + local
+      if (relative.containsMatch(`[*?\[{]`)) {
+        [base]
+      } else {
+        let exts = extensions.map { ext => ext.trimPrefix(".") }
+        let alternatives = if (exts.length == 1) { exts.join("") } else {
+          "{" + exts.join(",") + "}"
+        }
+        let dir = if (base.hasSuffix("/")) { base } else { base + "/" }
+        let depth = if (recursive) { "**/" } else { "" }
+        let files = [dir + depth + "*." + alternatives]
+        if (base.hasSuffix("/")) { files } else { [base, base + "." + alternatives] + files }
       }
     }
   }
@@ -410,11 +394,14 @@ type MochajsProject {
       if (loaded.hasSuffix(".yaml") or loaded.hasSuffix(".yml")) {
         text
       } else {
-        # Mocha strips comments from JSON configs. What is left is YAML too,
-        # once tabs, which JSON only allows as whitespace, are spaces.
+        # Mocha strips comments from JSON configs, but not from inside strings
+        # such as "test/**/*.js", so strings are matched to be kept. What is
+        # left is YAML too, once tabs, which JSON only allows as whitespace,
+        # are spaces.
         text
-          .replaceMatches(`(?s)/\*.*?\*/`, with: "")
-          .replaceMatches(`(?m)(^|\s)//.*$`, with: "")
+          .rewriteMatches(`"(?:[^"\\]|\\.)*"|(?s:/\*.*?\*/)|//[^\n]*`) { m =>
+            if (m.string.hasPrefix("\"")) { m.string } else { "" }
+          }
           .replace("\t", " ")
       }
     }

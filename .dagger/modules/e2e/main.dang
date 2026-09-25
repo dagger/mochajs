@@ -177,14 +177,21 @@ type E2E {
   }
 
   """
-  From a root holding no config, discovery returns every project beneath it;
-  entering one of them scopes discovery to that project alone. Keys are
-  workspace-root-relative wherever the caller stands.
+  From a directory in no project, discovery returns every project beneath it;
+  entering a project, or any directory inside it, scopes discovery to that
+  project alone. Keys are workspace-root-relative wherever the caller stands.
   """
   siblingDiscoveryCheck: Void @check {
     assertPaths(projects(siblings, "."), ["a", "b"], "from the workspace root")
     assertPaths(projects(siblings, "a"), ["a"], "from a")
     assertPaths(projects(siblings, "b"), ["b"], "from b")
+    assertPaths(projects(siblings, "a/test"), ["a"], "from a/test")
+
+    let grouped = directory
+      .withDirectory("apps/a", cjsProject)
+      .withDirectory("apps/b", cjsProject)
+      .withDirectory("libs/c", cjsProject)
+    assertPaths(projects(grouped, "apps"), ["apps/a", "apps/b"], "from apps")
 
     null
   }
@@ -280,49 +287,61 @@ type E2E {
   """
   Test files are keyed by project-relative path, found without running Mocha:
   the spec of a JSON or YAML config (a string or a list; globs, brace
-  alternatives, files and directories), `extension` and `recursive` for a
-  directory spec, and Mocha's default `./test` otherwise. A nested project's
-  files and node_modules are not the project's own, and the keys are sorted.
+  alternatives, files with or without their extension, and directories),
+  `extension` and `recursive` for a directory spec, and Mocha's default
+  `./test` otherwise. A nested project's files, node_modules and empty files
+  are left out, and the keys are sorted.
   """
   testFileDiscoveryCheck: Void @check {
     let ws = directory
       .withNewFile("string/.mocharc.json", "{\"spec\": \"test/*.test.js\"}\n")
-      .withNewFile("string/test/b.test.js", "")
-      .withNewFile("string/test/a.test.js", "")
-      .withNewFile("string/test/helper.js", "")
-      .withNewFile("string/test/deep/c.test.js", "")
+      .withNewFile("string/test/b.test.js", testSource)
+      .withNewFile("string/test/a.test.js", testSource)
+      .withNewFile("string/test/helper.js", testSource)
+      .withNewFile("string/test/deep/c.test.js", testSource)
+      .withNewFile("globbed/.mocharc.json", "{\"spec\": [\"test/**/*.spec.js\"]}\n")
+      .withNewFile("globbed/test/unit/a.spec.js", testSource)
+      .withNewFile("globbed/test/b.spec.js", testSource)
       .withNewFile(
         "list/.mocharc.yaml",
-        "spec:\n  - \"unit/**/*.spec.{js,mjs}\"\n  - ./e2e/smoke.js\n",
+        "spec:\n  - \"unit/**/*.spec.{js,mjs}\"\n  - ./e2e/smoke.js\n  - lib/helper\n",
       )
-      .withNewFile("list/unit/x.spec.js", "")
-      .withNewFile("list/unit/deep/y.spec.mjs", "")
-      .withNewFile("list/unit/z.spec.ts", "")
-      .withNewFile("list/unit/node_modules/dep/q.spec.js", "")
-      .withNewFile("list/e2e/smoke.js", "")
-      .withNewFile("list/e2e/other.js", "")
+      .withNewFile("list/unit/x.spec.js", testSource)
+      .withNewFile("list/unit/deep/y.spec.mjs", testSource)
+      .withNewFile("list/unit/z.spec.ts", testSource)
+      .withNewFile("list/unit/node_modules/dep/q.spec.js", testSource)
+      .withNewFile("list/e2e/smoke.js", testSource)
+      .withNewFile("list/e2e/other.js", testSource)
+      .withNewFile("list/unit/empty.spec.js", "")
+      .withNewFile("list/lib/helper.js", testSource)
       .withNewFile(
         "commented/.mocharc.jsonc",
         "// Mocha strips comments\n{\n\t\"spec\": [\"spec\"], /* a directory */\n\t\"extension\": \"ts\",\n\t\"recursive\": true // and walks it\n}\n",
       )
-      .withNewFile("commented/spec/a.ts", "")
-      .withNewFile("commented/spec/deep/b.ts", "")
-      .withNewFile("commented/spec/c.js", "")
+      .withNewFile("commented/spec/a.ts", testSource)
+      .withNewFile("commented/spec/deep/b.ts", testSource)
+      .withNewFile("commented/spec/c.js", testSource)
       .withNewFile("defaults/.mocharc.js", "module.exports = { spec: [\"other/*.js\"] };\n")
-      .withNewFile("defaults/test/a.js", "")
-      .withNewFile("defaults/test/b.cjs", "")
-      .withNewFile("defaults/test/c.mjs", "")
-      .withNewFile("defaults/test/d.ts", "")
-      .withNewFile("defaults/test/deep/e.js", "")
-      .withNewFile("defaults/other/f.js", "")
+      .withNewFile("defaults/test/a.js", testSource)
+      .withNewFile("defaults/test/b.cjs", testSource)
+      .withNewFile("defaults/test/c.mjs", testSource)
+      .withNewFile("defaults/test/d.ts", testSource)
+      .withNewFile("defaults/test/deep/e.js", testSource)
+      .withNewFile("defaults/other/f.js", testSource)
       .withNewFile("outer/.mocharc.yml", "spec: \"test/**/*.js\"\n")
-      .withNewFile("outer/test/a.js", "")
+      .withNewFile("outer/test/a.js", testSource)
       .withNewFile("outer/test/inner/.mocharc.yml", "{}\n")
-      .withNewFile("outer/test/inner/test/b.js", "")
+      .withNewFile("outer/test/inner/test/b.js", testSource)
       .asWorkspace
 
     assertTestFiles(ws, "string", ["test/a.test.js", "test/b.test.js"])
-    assertTestFiles(ws, "list", ["e2e/smoke.js", "unit/deep/y.spec.mjs", "unit/x.spec.js"])
+    assertTestFiles(
+      ws,
+      "list",
+      ["e2e/smoke.js", "lib/helper.js", "unit/deep/y.spec.mjs", "unit/x.spec.js"],
+    )
+    # A comment marker inside a JSON string is not a comment.
+    assertTestFiles(ws, "globbed", ["test/b.spec.js", "test/unit/a.spec.js"])
     assertTestFiles(ws, "commented", ["spec/a.ts", "spec/deep/b.ts"])
     assertTestFiles(ws, "defaults", ["test/a.js", "test/b.cjs", "test/c.mjs"])
     assertTestFiles(ws, "outer", ["test/a.js"])
@@ -337,6 +356,11 @@ type E2E {
     )
     null
   }
+
+  """
+  Test file contents for discovery, which only lists non-empty files.
+  """
+  let testSource: String! = "// a test\n"
 
   """
   Fail unless the project at path offers exactly the wanted test files, in
@@ -450,11 +474,20 @@ type E2E {
     if (testFailed(broken, "a")) {
       raise "testing from a should not have run the sibling project b"
     }
+    if (testFailed(broken, "a/test")) {
+      raise "testing from a/test should not have run the sibling project b"
+    }
     if (testFailed(
       siblings.withNewFile("a/test/broken.test.js", failingTest),
       "a",
     ) == false) {
       raise "testing from a should have run a's own tests"
+    }
+    if (testFailed(
+      siblings.withNewFile("a/test/broken.test.js", failingTest),
+      "a/test",
+    ) == false) {
+      raise "testing from a/test should have run the enclosing project a"
     }
 
     null

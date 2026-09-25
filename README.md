@@ -1,104 +1,113 @@
 # Mocha Dagger Toolchain
 
+Runs [Mocha](https://mochajs.org) tests as Dagger checks, one check per test
+file, across every Mocha project in a workspace.
+
+## Requirements
+
+Dagger engine `v1.0.0-beta.15` or later. The module uses Dagger collections,
+which older engines cannot load; until beta.15 is released, run it on a dev
+engine.
+
 ## Installation
 
-```
-dagger toolchain install github.com/dagger/mochajs
+```console
+$ dagger install github.com/dagger/mochajs
 ```
 
 ## Checks
 
-The toolchain has one check, `test`, and it runs per test file:
+The module has one check, `test`, and it runs per test file. Its address is
+`mochajs/projects/tests/test`, and it has two dimensions:
+
+| Flag | Selects |
+| --- | --- |
+| `--mochajs-project=PATH` | a project, by its root relative to the workspace root (repeatable) |
+| `--mochajs-test-file=PATH` | a test file, by its path relative to the project root (repeatable) |
+| `--mochajs`, `--by-mochajs` | this module's checks |
+| `--test`, `--check-test` | checks named `test`, in every installed module |
 
 ```console
-$ dagger check -l --all --mochajs                 # one line per project and test file
-$ dagger check --mochajs --test                   # every project, each run whole
-$ dagger check --mochajs --test --mochajs-project=packages/api
-$ dagger check --mochajs --test --mochajs-project=packages/api --mochajs-test-file=test/auth.test.js
-$ dagger check mochajs/projects/tests/test --mochajs-project=packages/api   # the same, by path
-$ dagger list mochajs-projects
-$ dagger list mochajs-test-files --mochajs-project=packages/api
+$ dagger check -l --all --mochajs                  # one line per project and test file
+$ dagger check --mochajs --test                    # every project, each run whole
+$ dagger check --mochajs --test --mochajs-project=api
+$ dagger check --mochajs --test --mochajs-project=api --mochajs-test-file=test/unit/t1.spec.js
+$ dagger check mochajs/projects/tests/test --mochajs-project=api   # the same, by path
+$ dagger list mochajs-projects -a
+$ dagger list mochajs-test-files -a --mochajs-project=api
 ```
 
 `--test` alone also selects every other installed module's check named `test`;
 `--mochajs` narrows it to this one. When another installed module also has a
-`MochajsProject` or `MochajsTestFile` type the flags take a qualified name, so
+`MochajsProject` or `MochajsTestFile` type, the flags take a qualified name;
 `dagger check --help` lists the flags in effect.
 
 `test` runs once per selected project. With every test file of a project
-selected, it runs `npx mocha` in the project root as the project's own Mocha
+selected, it runs `npx mocha` in the project root, and the project's own Mocha
 config selects the tests. With some files filtered out, it runs only the
 selected files: the project's config still applies, minus its `spec`, which
 Mocha would otherwise add to the files named on the command line.
 
-## API
+## Selecting by directory
 
-- `projects(ws)`: the Mocha projects visible from the current directory, as a
-  collection keyed by project root, relative to the workspace root.
-- On a project: `tests(ws)` (its test files, as a collection keyed by path
-  relative to the project root), `test(ws)` (run the whole project), `list(ws)`
-  (the tests `mocha --dry-run` reports) and `source(ws)`.
-- On a test file: `test(ws)`, a check.
+Discovery starts from the directory you run Dagger in, so changing directory
+selects projects without any flag:
 
-`test` on a project, and the `projects` batch `test`, are plain functions
-rather than checks, so `dagger check` does not run the same tests twice.
-
-## Project discovery
-
-Discovery is anchored at the directory you run Dagger from: `dagger check` tests
-the project you are in and the projects beneath it. A project is any directory
-holding a `.mocharc.*` file (`node_modules` excluded); a `mocha` key in
-`package.json` also configures Mocha, but `package.json` marks every npm
-package, so it is not a discovery marker.
+- In a project's root: that project and the projects below it.
+- Anywhere inside a project, below its root: that project, plus any projects
+  below the current directory.
+- In a directory that belongs to no project: the projects below it.
 
 ```console
-# from the workspace root of a monorepo holding a/ and b/
-$ dagger list mochajs-projects -a    # -> a, b
-
-# from a/
-$ dagger list mochajs-projects -a    # -> a
+$ cd api/test/unit && dagger check    # tests api, and only api
+$ cd web && dagger check              # tests web and web/plugins/charts
 ```
 
-A directory holding no config of its own sits inside its enclosing project, so
-that project is listed and runs too. To run a single project, enter it or
-select it with `--mochajs-project`. Project keys are always relative to the
-workspace root, wherever you run Dagger from.
+Project keys are always relative to the workspace root, wherever you run
+Dagger from.
 
-## Test file discovery
+## Discovery
 
-Test files are found by globbing the workspace, not by running Mocha, so
-listing them starts no container. Discovery reads the config Mocha would load
-(`.mocharc.cjs`, `.js`, `.yaml`, `.yml`, `.jsonc`, `.json`, in that order):
+A project is any directory holding a `.mocharc.*` file (`.js`, `.cjs`, `.mjs`,
+`.json`, `.jsonc`, `.yaml`, `.yml`); `node_modules` is not searched. A `mocha`
+key in `package.json` also configures Mocha, but every npm package has a
+`package.json`, so it does not mark a project.
+
+A project's test files are found without running Mocha or starting a container:
+one search (ripgrep) over the project, skipping `node_modules` and `.git`.
+Discovery reads the config Mocha would load (`.mocharc.cjs`, `.js`, `.yaml`,
+`.yml`, `.jsonc`, `.json`, in that order):
 
 - From a JSON or YAML config it reads `spec` (a string or a list of globs,
-  files and directories; `{a,b}` alternatives included), and `extension` and
-  `recursive` for a directory spec.
+  files, files without their extension, and directories; `{a,b}` alternatives
+  included), and `extension` and `recursive` for a directory spec.
 - Otherwise it uses Mocha's default spec: `./test/*.{js,cjs,mjs}`, not
   recursive.
 
-Files under `node_modules` and inside a nested project belong to neither
-project's list. The limits of reading the config statically:
+Files inside a nested project belong to that project, not to the enclosing
+one. Keys are sorted. The limits of reading the config without running it:
 
 - A JavaScript config is not evaluated, so its `spec` is not seen and the
-  default is listed instead. A whole-project run still uses it, since that is
-  Mocha's own run.
+  default is listed instead. A whole-project run still uses it, since that run
+  is Mocha's own.
 - The `mocha` key of `package.json`, the `ignore` option, and spec entries
   outside the project are not read.
+- Empty files are not listed.
 - A project whose spec matches no file lists no test files, so `dagger check`
-  does not run it. Run it with the project's `test` function instead.
+  does not run it. Call the project's `test` function to run it.
 
-## Customization
+## Settings
 
-The toolchain can be customized in your `dagger.toml` to meet your needs:
+Set these in your `dagger.toml`:
 
 ```toml
 [modules.mochajs]
 source = "github.com/dagger/mochajs"
 
-# default: node:25-alpine; use any container image
+# default: "node:25-alpine"; any image with Node.js
 settings.baseImageAddress = "node:22"
 
-# default: npm; alternatively use yarn, pnpm, or bun
+# default: "npm"; alternatively yarn, pnpm, or bun
 settings.packageManager = "yarn"
 
 # default: false; run the package's build script before testing
@@ -106,6 +115,41 @@ settings.build = true
 
 # default: []; extra flags passed to mocha
 settings.flags = ["--bail"]
+```
+
+## Using it from another module
+
+`projects(ws)` returns the projects as a collection. Callers get `keys`,
+`get(key:)`, `subset(keys:)`, `list`, and the collection's own functions under
+`batch`:
+
+| Function | What it does |
+| --- | --- |
+| `projects(ws).keys` | project roots |
+| `projects(ws).batch.test(ws)` | run every project, whole; a plain function |
+| `projects(ws).get(key: p).test(ws)` | run one project, whole; a plain function |
+| `projects(ws).get(key: p).list(ws)` | the tests `mocha --dry-run` reports |
+| `projects(ws).get(key: p).source(ws)` | the project's source directory |
+| `projects(ws).get(key: p).tests(ws)` | the project's test files, as a collection |
+| `tests.batch.test(ws)` | run the selected test files; a check |
+| `tests.get(key: f).test(ws)` | run one test file; a check |
+
+`test` on a project and the `projects` batch `test` are plain functions, not
+checks, so `dagger check` does not run the same tests twice. A check called
+through a dependency returns a `Check` that has not run yet. Run it and raise
+its failure:
+
+```dang
+let run(check: Check!): Void {
+  if (check.pass == false) {
+    raise check.error.message ?? "check failed"
+  }
+  null
+}
+
+let tests = mochajs.projects(ws).get(key: "api").tests(ws)
+run(tests.batch.test(ws))                                          # whole project
+run(tests.subset(keys: ["test/unit/t1.spec.js"]).batch.test(ws))   # only this file
 ```
 
 # @dagger.io/mocha

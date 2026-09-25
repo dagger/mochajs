@@ -23,15 +23,58 @@ type E2E {
     currentModule.source.directory("modules/esm")
   }
 
+  let assert(condition: Boolean!, message: String!): Void {
+    if (condition == false) {
+      raise message
+    }
+    null
+  }
+
+  """
+  Run a check, raising its failure. A check called through a dependency comes
+  back as a Check that has not run.
+  """
+  let run(check: Check!): Void {
+    # Check.error is not null for a passing check when read from Dang, so ask
+    # pass first and read the message only on failure.
+    if (check.pass == false) {
+      raise check.error.message ?? "check failed"
+    }
+    null
+  }
+
+  """
+  Whether a check failed when run.
+  """
+  let failed(check: Check!): Boolean! {
+    {
+      run(check)
+      false
+    } rescue true
+  }
+
   """
   Run the toolchain against the sample projects, exercising the real thing:
   discovery, the local build of the otel library, and a Mocha run under both
-  module systems.
+  module systems, of a whole project and of a single test file.
   """
   sampleProjectsCheck: Void @check {
-    mochajs.testAll(cjsProject.asWorkspace)
-    mochajs.testAll(esmProject.asWorkspace)
+    testSample(cjsProject)
+    testSample(esmProject)
 
+    null
+  }
+
+  let testSample(project: Directory!): Void {
+    let ws = project.asWorkspace
+    let projects = mochajs.projects(ws)
+    assertPaths(projects.keys, ["."], "sample project discovery")
+    projects.batch.test(ws)
+
+    let tests = projects.get(key: ".").tests(ws)
+    assertPaths(tests.keys, ["test/index.test.js"], "sample test file discovery")
+    run(tests.batch.test(ws))
+    run(tests.get(key: "test/index.test.js").test(ws))
     null
   }
 
@@ -39,7 +82,8 @@ type E2E {
   `list` reports the tests a project would run without running them.
   """
   listCheck: Void @check {
-    let listed = mochajs.list(cjsProject.asWorkspace)
+    let ws = cjsProject.asWorkspace
+    let listed = mochajs.projects(ws).get(key: ".").list(ws)
 
     if (listed.contains("nested suite") == false) {
       raise "list did not report the fixture's tests: " + listed
@@ -63,7 +107,7 @@ type E2E {
       .withNewFile("yml/.mocharc.yml", "{}\n")
 
     assertPaths(
-      mochajs.projects(tree.asWorkspace),
+      mochajs.projects(tree.asWorkspace).keys,
       ["js", "cjs", "mjs", "json", "jsonc", "yaml", "yml"],
       "one project per config filename",
     )
@@ -112,7 +156,7 @@ type E2E {
   Discovery from `cwd` inside a synthetic workspace built from `tree`.
   """
   let projects(tree: Directory!, cwd: String!): [String!]! {
-    mochajs.projects(tree.asWorkspace(cwd: cwd))
+    mochajs.projects(tree.asWorkspace(cwd: cwd)).keys
   }
 
   """
@@ -134,12 +178,13 @@ type E2E {
 
   """
   From a root holding no config, discovery returns every project beneath it;
-  entering one of them scopes discovery to that project alone.
+  entering one of them scopes discovery to that project alone. Keys are
+  workspace-root-relative wherever the caller stands.
   """
   siblingDiscoveryCheck: Void @check {
     assertPaths(projects(siblings, "."), ["a", "b"], "from the workspace root")
-    assertPaths(projects(siblings, "a"), ["."], "from a")
-    assertPaths(projects(siblings, "b"), ["."], "from b")
+    assertPaths(projects(siblings, "a"), ["a"], "from a")
+    assertPaths(projects(siblings, "b"), ["b"], "from b")
 
     null
   }
@@ -150,24 +195,25 @@ type E2E {
   """
   nestedDiscoveryCheck: Void @check {
     assertPaths(projects(nested, "."), [".", "a", "b"], "from the workspace root")
-    assertPaths(projects(nested, "a"), ["."], "from a")
-    assertPaths(projects(nested, "b"), ["."], "from b")
+    assertPaths(projects(nested, "a"), ["a"], "from a")
+    assertPaths(projects(nested, "b"), ["b"], "from b")
 
     null
   }
 
   """
   From a subdirectory holding no config, the nearest enclosing project is
-  reported as a ".."-relative path alongside the projects below the cwd, and
-  that path resolves back to the enclosing project through the workspace.
+  reported alongside the projects below the cwd, keyed by its root rather than
+  by a ".."-relative path, and that key resolves back to the enclosing project.
   """
   ancestorDiscoveryCheck: Void @check {
     let ws = ancestor.asWorkspace(cwd: "work")
+    let found = mochajs.projects(ws)
 
-    assertPaths(mochajs.projects(ws), ["..", "app"], "from work")
+    assertPaths(found.keys, [".", "work/app"], "from work")
 
-    if (ws.directory("..").glob(".mocharc.json").length != 1) {
-      raise "the returned ancestor path did not resolve back to the enclosing project"
+    if (found.get(key: ".").source(ws).glob(".mocharc.json").length != 1) {
+      raise "the enclosing project's key did not resolve back to it"
     }
 
     null
@@ -186,54 +232,244 @@ type E2E {
   }
 
   """
+  Projects form a collection keyed by project root. get builds the project at
+  a key; subset keeps parent order, rejects unknown and duplicate keys, and
+  narrows what get accepts and what the batch runs; an empty subset is valid
+  and runs nothing.
+  """
+  collectionCheck: Void @check {
+    let ws = siblings
+      .withDirectory("c", cjsProject)
+      .withNewFile("b/test/broken.test.js", failingTest)
+      .asWorkspace
+    let all = mochajs.projects(ws)
+    assert(all.keys == ["a", "b", "c"], "keys were not sorted: " + all.keys.join(", "))
+    assert(all.get(key: "b").path == "b", "get did not return the project at its key")
+
+    let pair = all.subset(keys: ["c", "a"])
+    assert(pair.keys == ["a", "c"], "subset did not keep parent order: " + pair.keys.join(", "))
+    pair.batch.test(ws)
+
+    let outside = { pair.get(key: "b").path } rescue {
+      err: Error => "rejected"
+    }
+    assert(outside == "rejected", "get accepted a key outside the subset")
+
+    let unknown = { all.subset(keys: ["no/such/project"]).keys.join(","); "accepted" } rescue {
+      err: Error => "rejected"
+    }
+    assert(unknown == "rejected", "subset accepted an unknown key")
+
+    let duplicate = { all.subset(keys: ["a", "a"]).keys.join(","); "accepted" } rescue {
+      err: Error => "rejected"
+    }
+    assert(duplicate == "rejected", "subset accepted a duplicate key")
+
+    let none = all.subset(keys: [])
+    assert(none.keys.length == 0, "empty subset kept keys: " + none.keys.join(", "))
+    none.batch.test(ws)
+
+    let failure = { all.batch.test(ws); "unexpected success" } rescue {
+      err: Error => err.message
+    }
+    assert(failure.contains("- b:"), "batch test did not name the failing project: " + failure)
+    assert(failure.contains("- a:") == false, "batch test named a passing project: " + failure)
+    null
+  }
+
+  """
+  Test files are keyed by project-relative path, found without running Mocha:
+  the spec of a JSON or YAML config (a string or a list; globs, brace
+  alternatives, files and directories), `extension` and `recursive` for a
+  directory spec, and Mocha's default `./test` otherwise. A nested project's
+  files and node_modules are not the project's own, and the keys are sorted.
+  """
+  testFileDiscoveryCheck: Void @check {
+    let ws = directory
+      .withNewFile("string/.mocharc.json", "{\"spec\": \"test/*.test.js\"}\n")
+      .withNewFile("string/test/b.test.js", "")
+      .withNewFile("string/test/a.test.js", "")
+      .withNewFile("string/test/helper.js", "")
+      .withNewFile("string/test/deep/c.test.js", "")
+      .withNewFile(
+        "list/.mocharc.yaml",
+        "spec:\n  - \"unit/**/*.spec.{js,mjs}\"\n  - ./e2e/smoke.js\n",
+      )
+      .withNewFile("list/unit/x.spec.js", "")
+      .withNewFile("list/unit/deep/y.spec.mjs", "")
+      .withNewFile("list/unit/z.spec.ts", "")
+      .withNewFile("list/unit/node_modules/dep/q.spec.js", "")
+      .withNewFile("list/e2e/smoke.js", "")
+      .withNewFile("list/e2e/other.js", "")
+      .withNewFile(
+        "commented/.mocharc.jsonc",
+        "// Mocha strips comments\n{\n\t\"spec\": [\"spec\"], /* a directory */\n\t\"extension\": \"ts\",\n\t\"recursive\": true // and walks it\n}\n",
+      )
+      .withNewFile("commented/spec/a.ts", "")
+      .withNewFile("commented/spec/deep/b.ts", "")
+      .withNewFile("commented/spec/c.js", "")
+      .withNewFile("defaults/.mocharc.js", "module.exports = { spec: [\"other/*.js\"] };\n")
+      .withNewFile("defaults/test/a.js", "")
+      .withNewFile("defaults/test/b.cjs", "")
+      .withNewFile("defaults/test/c.mjs", "")
+      .withNewFile("defaults/test/d.ts", "")
+      .withNewFile("defaults/test/deep/e.js", "")
+      .withNewFile("defaults/other/f.js", "")
+      .withNewFile("outer/.mocharc.yml", "spec: \"test/**/*.js\"\n")
+      .withNewFile("outer/test/a.js", "")
+      .withNewFile("outer/test/inner/.mocharc.yml", "{}\n")
+      .withNewFile("outer/test/inner/test/b.js", "")
+      .asWorkspace
+
+    assertTestFiles(ws, "string", ["test/a.test.js", "test/b.test.js"])
+    assertTestFiles(ws, "list", ["e2e/smoke.js", "unit/deep/y.spec.mjs", "unit/x.spec.js"])
+    assertTestFiles(ws, "commented", ["spec/a.ts", "spec/deep/b.ts"])
+    assertTestFiles(ws, "defaults", ["test/a.js", "test/b.cjs", "test/c.mjs"])
+    assertTestFiles(ws, "outer", ["test/a.js"])
+    assertTestFiles(ws, "outer/test/inner", ["test/b.js"])
+
+    # Keys are relative to the project, not the caller.
+    let inside = mochajs.projects(ws.withWorkdir("string/test"))
+    assert(inside.keys == ["string"], "discovery from inside a project: " + inside.keys.join(", "))
+    assert(
+      inside.get(key: "string").tests(ws).keys == ["test/a.test.js", "test/b.test.js"],
+      "test files from inside a project",
+    )
+    null
+  }
+
+  """
+  Fail unless the project at path offers exactly the wanted test files, in
+  order.
+  """
+  let assertTestFiles(ws: Workspace!, path: String!, want: [String!]!): Void {
+    let got = mochajs.projects(ws).get(key: path).tests(ws).keys
+    assert(
+      got == want,
+      path + ": got [" + got.join(", ") + "], want [" + want.join(", ") + "]",
+    )
+  }
+
+  """
+  A project's test files form a collection: with nothing filtered out, the
+  batch runs the project as Mocha's own config selects it; a subset, or one
+  file, runs only its own files, even though the config's spec covers more.
+  """
+  testFilesCheck: Void @check {
+    let ws = cjsProject.withNewFile("test/broken.test.js", failingTest).asWorkspace
+    let tests = mochajs.projects(ws).get(key: ".").tests(ws)
+    assert(
+      tests.keys == ["test/broken.test.js", "test/index.test.js"],
+      "test files: " + tests.keys.join(", "),
+    )
+
+    assert(failed(tests.batch.test(ws)), "the whole project run missed the failing file")
+    run(tests.subset(keys: ["test/index.test.js"]).batch.test(ws))
+    run(tests.get(key: "test/index.test.js").test(ws))
+    assert(
+      failed(tests.subset(keys: ["test/broken.test.js"]).batch.test(ws)),
+      "the failing file passed on its own",
+    )
+    assert(
+      failed(tests.get(key: "test/broken.test.js").test(ws)),
+      "the failing file's check passed",
+    )
+    run(tests.subset(keys: []).batch.test(ws))
+
+    # A JS config is not read, so its spec reaches a failing file discovery
+    # does not list. Only the whole run, which is Mocha's own, runs it.
+    let hidden = cjsProject
+      .withoutFile(".mocharc.json")
+      .withNewFile(
+        ".mocharc.cjs",
+        "module.exports = { spec: [\"test/*.test.js\", \"extra/*.js\"] };\n",
+      )
+      .withNewFile("extra/broken.js", failingTest)
+      .asWorkspace
+    let hiddenTests = mochajs.projects(hidden).get(key: ".").tests(hidden)
+    assert(
+      hiddenTests.keys == ["test/index.test.js"],
+      "test files under a JS config: " + hiddenTests.keys.join(", "),
+    )
+    assert(failed(hiddenTests.batch.test(hidden)), "the whole run did not use Mocha's own config")
+    run(hiddenTests.get(key: "test/index.test.js").test(hidden))
+    null
+  }
+
+  """
+  Settings apply to every run: flags reach Mocha whether the project runs
+  whole or file by file.
+  """
+  settingsCheck: Void @check {
+    let ws = cjsProject.withNewFile("test/broken.test.js", failingTest).asWorkspace
+    let tests = mochajs(flags: ["--grep", "passes"]).projects(ws).get(key: ".").tests(ws)
+    run(tests.batch.test(ws))
+    run(tests.get(key: "test/broken.test.js").test(ws))
+    null
+  }
+
+  """
   A failing test file, used to observe which projects a run actually covered.
   """
   let failingTest: String! =
     "const assert = require(\"node:assert\");\n\ndescribe(\"broken\", () => {\n  it(\"fails\", () => {\n    assert.equal(1, 2);\n  });\n});\n"
 
   """
-  Whether `testAll` from `cwd` observed the failure planted in `tree`.
+  Whether testing every project visible from `cwd` observed the failure
+  planted in `tree`, through the project batch and through the test file
+  checks of each project.
   """
-  let testAllFailed(tree: Directory!, cwd: String!): Boolean! {
-    {
-      mochajs.testAll(tree.asWorkspace(cwd: cwd))
+  let testFailed(tree: Directory!, cwd: String!): Boolean! {
+    let ws = tree.asWorkspace(cwd: cwd)
+    let all = mochajs.projects(ws)
+    let batch = {
+      all.batch.test(ws)
       false
     } rescue true
+    let checks = all.keys.any { key =>
+      failed(
+        all.get(key: key).tests(ws).batch.test(ws),
+      )
+    }
+    if (batch != checks) {
+      raise "the project batch and the test file checks disagreed from " + cwd
+    }
+    batch
   }
 
   """
-  `testAll` runs every project below the cwd, and entering one of them leaves
-  its siblings out of reach.
+  Testing from the workspace root runs every project below it, and entering
+  one of them leaves its siblings out of reach.
   """
   descendantScopeCheck: Void @check {
     let broken = siblings.withNewFile("b/test/broken.test.js", failingTest)
 
-    if (testAllFailed(broken, ".") == false) {
-      raise "testAll from the workspace root should have run the project b"
+    if (testFailed(broken, ".") == false) {
+      raise "testing from the workspace root should have run the project b"
     }
-    if (testAllFailed(broken, "a")) {
-      raise "testAll from a should not have run the sibling project b"
+    if (testFailed(broken, "a")) {
+      raise "testing from a should not have run the sibling project b"
     }
-    if (testAllFailed(
+    if (testFailed(
       siblings.withNewFile("a/test/broken.test.js", failingTest),
       "a",
     ) == false) {
-      raise "testAll from a should have run a's own tests"
+      raise "testing from a should have run a's own tests"
     }
 
     null
   }
 
   """
-  A cwd holding no config sits inside its enclosing project, so `testAll` runs
-  that project too rather than only the ones below the cwd.
+  A cwd holding no config sits inside its enclosing project, so that project is
+  tested too rather than only the ones below the cwd.
   """
   ancestorScopeCheck: Void @check {
-    if (testAllFailed(
+    if (testFailed(
       ancestor.withNewFile("test/broken.test.js", failingTest),
       "work",
     ) == false) {
-      raise "testAll from work should have run the enclosing project"
+      raise "testing from work should have run the enclosing project"
     }
 
     null

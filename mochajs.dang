@@ -13,6 +13,16 @@ type Mochajs {
   packageManager: String! = "npm"
 
   """
+  Run the package's build script before testing.
+  """
+  build: Boolean! = false
+
+  """
+  Extra flags passed to mocha.
+  """
+  flags: [String!]! = []
+
+  """
   Filenames that mark a Mocha project. A `mocha` key in package.json also
   configures Mocha, but package.json marks every npm package, so it is not a
   discovery marker.
@@ -28,125 +38,50 @@ type Mochajs {
   ]
 
   """
-  The Mocha projects visible from the client's cwd: every project at or below
-  it, plus the nearest enclosing project when the cwd holds no config of its
-  own. Paths are cwd-relative, so a ".." prefix marks an enclosing project.
+  Mocha projects visible from the working directory, keyed by project root.
   """
-  projects(ws: Workspace!): [String!]! {
-    ws.findRoots(
-      markers: configNames,
-      exclude: ["**/node_modules/**"],
-    )
+  projects(ws: Workspace!): MochajsProjects! {
+    MochajsProjects(paths: sorted(projectRoots(ws, "")), tool: self)
   }
 
   """
-  Execute the tests of every project visible from the client's cwd. A cwd that
-  holds no config of its own sits inside its enclosing project, so that project
-  runs too; enter a subproject to run it alone.
+  Workspace-root-relative roots of the Mocha projects found from `start`: every
+  project at or below it, plus the nearest enclosing project when `start` holds
+  no config of its own. An empty `start` is the caller's cwd.
   """
-  testAll(
-    ws: Workspace!,
-    """
-    Run build before test
-    """
-    build: Boolean! = false,
-    """
-    Flags to pass to mocha
-    """
-    flags: [String!]! = [],
-  ): Void @check {
-    projects(ws).each { path => test(ws, path: path, build: build, flags: flags) }
-
-    null
-  }
-
-  """
-  Execute the tests of a single project
-  """
-  test(
-    ws: Workspace!,
-    """
-    Path of the project to test, relative to the client's cwd
-    """
-    path: String! = ".",
-    """
-    List of files to test
-    """
-    files: [String!]! = [],
-    """
-    Run build before test
-    """
-    build: Boolean! = false,
-    """
-    Flags to pass to mocha
-    """
-    flags: [String!]! = [],
-  ): Void {
-    let src = source(ws, path: path)
-    let n = nodejs(src, baseImageAddress, packageManager)
-    let runtime = n.base
-
-    # optionally build first
-    if (build) {
-      runtime = runtime.withExec([packageManager, "run", "build"])
+  let projectRoots(ws: Workspace!, start: String!): [String!]! {
+    let found = if (start == "") {
+      ws.findRoots(markers: configNames, exclude: ["**/node_modules/**"])
+    } else {
+      ws.findRoots(
+        start: start,
+        markers: configNames,
+        exclude: ["**/node_modules/**"],
+      )
     }
+    found.map { dir => workspaceRootPath(ws, dir) }.uniq
+  }
 
-    # install the local build of the otel library
-    runtime = n.withInstallLocalPackage(runtime, buildLibrary)
+  """
+  Resolve a path relative to the caller's cwd, as findRoots returns them, into
+  a workspace-root-relative one, collapsing any leading "..".
+  """
+  let workspaceRootPath(ws: Workspace!, cwdRelPath: String!): String! {
+    let segments = cwdRelPath.split("/").filter { s => s != "" and s != "." }
+    let up = segments.filter { s => s == ".." }.length
+    let down = segments.filter { s => s != ".." }
+    let resolved = ws.cwd.split("/").filter { s => s != "" }.dropLast(up) + down
+    if (resolved.length == 0) { "." } else { resolved.join("/") }
+  }
 
-    # Node resolves the register file through the package exports, and a
-    # CommonJS project can only preload the CommonJS one.
-    let packageType = container
-      .from("alpine:3")
-      .withExec(["apk", "add", "jq"])
-      .withFile("/package.json", src.file("package.json"))
-      .withExec(["jq", ".type", "/package.json"])
-      .stdout
-
-    let opts = "$NODE_OPTIONS --import @dagger.io/mocha/register "
-    if (packageType.contains("commonjs")) {
-      opts = "$NODE_OPTIONS --require @dagger.io/mocha/register "
+  """
+  Strings in byte order.
+  """
+  let sorted(items: [String!]!): [String!]! {
+    let empty: [String!]! = []
+    items.reduce(empty) { acc, item =>
+      acc.takeWhile { x => x <= item } + [item] + acc.dropWhile { x => x <= item }
     }
-
-    # mount and install the otel library and then execute the tests
-    runtime
-      .withEnvVariable("NODE_OPTIONS", opts, expand: true)
-      .withEnvVariable("DAGGER_MOCHA_CACHE_BUSTER", UUID.v7)
-      .withExec(["npx", "mocha"] + flags + files)
-      .sync
-
-    null
-  }
-
-  """
-  List the tests of a single project
-  """
-  list(
-    ws: Workspace!,
-    """
-    Path of the project to list, relative to the client's cwd
-    """
-    path: String! = ".",
-  ): String! {
-    let cmd = ["npx", "mocha", "--dry-run"]
-
-    nodejs(source(ws, path: path), baseImageAddress, packageManager)
-      .base
-      .withExec(cmd)
-      .stdout
-  }
-
-  """
-  The source directory of a project, relative to the client's cwd
-  """
-  source(
-    ws: Workspace!,
-    """
-    Path of the project, relative to the client's cwd
-    """
-    path: String! = ".",
-  ): Directory! {
-    ws.directory(path, exclude: ["**/node_modules", "dist", "build"])
   }
 
   """
@@ -167,5 +102,432 @@ type Mochajs {
       .withExec(["bun", "install"])
       .withExec(["bun", "run", "build"])
       .directory("/src")
+  }
+}
+
+# Keep all Dang types in one source file until Dagger v0.21.x can
+# convert Workspace arguments for installed multi-file Dang toolchains.
+# See dagger/dagger#13476.
+
+"""
+Mocha projects in a workspace, keyed by project root.
+"""
+type MochajsProjects @collection {
+  """
+  Project root paths, relative to the workspace root.
+  """
+  paths: [String!]! @keys
+
+  """
+  Settings every project is tested with.
+  """
+  let tool: Mochajs!
+
+  """
+  The Mocha project rooted at path.
+  """
+  project(path: String!): MochajsProject! @get {
+    MochajsProject(path: path, tool: tool)
+  }
+
+  """
+  Run tests in the selected Mocha projects.
+  """
+  test(ws: Workspace!): Void {
+    # A selection over a list evaluates its elements concurrently, so all
+    # project test runs happen in parallel.
+    let failures = paths.map { p => project(p) }.{{path, failure: testFailure(ws)}}
+      .filter { result => result.failure != null }
+    if (failures.length > 0) {
+      raise "Mocha tests failed:\n" + failures.map { result =>
+        "- " + result.path + ": " + (result.failure ?? "")
+      }.join("\n")
+    }
+    null
+  }
+}
+
+"""
+A Mocha project rooted at a workspace-relative path.
+"""
+type MochajsProject {
+  """
+  Project root, relative to the workspace.
+  """
+  path: String!
+
+  """
+  Settings this project is tested with.
+  """
+  let tool: Mochajs!
+
+  """
+  Test files in this project, keyed by project-relative path.
+  """
+  tests(ws: Workspace!): MochajsTestFiles! {
+    MochajsTestFiles(files: testFiles(ws), project: self)
+  }
+
+  """
+  Run this project's tests.
+  """
+  test(ws: Workspace!): Void {
+    let failure = testFailure(ws)
+    if (failure != null) {
+      raise "Mocha tests in " + path + ": " + failure
+    }
+    null
+  }
+
+  """
+  List the tests of this project.
+  """
+  list(ws: Workspace!): String! {
+    nodejs(source(ws), tool.baseImageAddress, tool.packageManager)
+      .base
+      .withExec(["npx", "mocha", "--dry-run"])
+      .stdout
+  }
+
+  """
+  The source directory of this project.
+  """
+  source(ws: Workspace!): Directory! {
+    ws.directory(absolutePath, exclude: ["**/node_modules", "dist", "build"])
+  }
+
+  """
+  The project root as an absolute workspace path, which every Workspace API
+  resolves against the workspace root.
+  """
+  let absolutePath: String! {
+    if (path == ".") { "/" } else { "/" + path }
+  }
+
+  """
+  Prefix turning a project-relative path into a workspace-root-relative one,
+  the form Workspace.glob matches.
+  """
+  let globPrefix: String! {
+    if (path == ".") { "" } else { path + "/" }
+  }
+
+  """
+  Error message from running this project's tests, or null when they pass.
+  """
+  let testFailure(ws: Workspace!): String {
+    { testExec(ws, []).sync; null } rescue {
+      err: Error => err.message
+    }
+  }
+
+  """
+  Run the given test files, naming this project when they fail.
+  """
+  let runFiles(ws: Workspace!, files: [String!]!): Void {
+    testExec(ws, files).sync rescue {
+      err: Error => raise "Mocha tests in " + path + ": " + err.message
+    }
+    null
+  }
+
+  """
+  Where the config that runs only the named files is mounted.
+  """
+  let filesConfigPath: String! = "/dagger-mocha/mocharc.cjs"
+
+  """
+  A Mocha config that loads the project's own config the way Mocha would,
+  minus its spec. Mocha adds the configured spec to any files named on the
+  command line, so running only the named files means dropping it.
+  """
+  let filesConfig: String! = ```
+  const paths = [process.cwd()];
+  const { loadRc, loadPkgRc } = require(require.resolve("mocha/lib/cli/options", { paths }));
+  const rc = loadRc() || {};
+  const pkg = loadPkgRc() || {};
+  const config = { ...pkg };
+  for (const [key, value] of Object.entries(rc)) {
+    config[key] = Array.isArray(value) && Array.isArray(config[key]) ? [...config[key], ...value] : value;
+  }
+  delete config.spec;
+  delete config._;
+  module.exports = config;
+  ```
+
+  """
+  Container that has run this project's tests: the whole project, as Mocha's
+  own config selects it, when files is empty, or else only the named files.
+  """
+  let testExec(ws: Workspace!, files: [String!]!): Container! {
+    let src = source(ws)
+    let n = nodejs(src, tool.baseImageAddress, tool.packageManager)
+    let runtime = n.base
+
+    # optionally build first
+    if (tool.build) {
+      runtime = runtime.withExec([tool.packageManager, "run", "build"])
+    }
+
+    # install the local build of the otel library
+    runtime = n.withInstallLocalPackage(runtime, tool.buildLibrary)
+
+    # Node resolves the register file through the package exports, and a
+    # CommonJS project can only preload the CommonJS one.
+    let packageType = container
+      .from("alpine:3")
+      .withExec(["apk", "add", "jq"])
+      .withFile("/package.json", src.file("package.json"))
+      .withExec(["jq", ".type", "/package.json"])
+      .stdout
+
+    let opts = "$NODE_OPTIONS --import @dagger.io/mocha/register "
+    if (packageType.contains("commonjs")) {
+      opts = "$NODE_OPTIONS --require @dagger.io/mocha/register "
+    }
+
+    runtime = runtime
+      .withEnvVariable("NODE_OPTIONS", opts, expand: true)
+      .withEnvVariable("DAGGER_MOCHA_CACHE_BUSTER", UUID.v7)
+
+    if (files.length == 0) {
+      runtime.withExec(["npx", "mocha"] + tool.flags)
+    } else {
+      runtime
+        .withNewFile(filesConfigPath, filesConfig)
+        .withExec(["npx", "mocha", "--config", filesConfigPath, "--no-package"] + tool.flags
+          + files)
+    }
+  }
+
+  # Test files are found by globbing the workspace rather than asking Mocha,
+  # so listing them runs no container. Only what Mocha reads from a JSON or
+  # YAML config is followed: a JS config is not evaluated, the `mocha` key of
+  # package.json and the `ignore` option are not read, and a project whose
+  # config cannot be read statically is assumed to use Mocha's defaults.
+  let testFiles(ws: Workspace!): [String!]! {
+    let text = configText(ws)
+    let specs = if (text == null) { null } else { specOption(text ?? "") }
+    let extensions = if (text == null) { null } else { extensionOption(text ?? "") }
+    let recursive = if (text == null) { false } else { recursiveOption(text ?? "") }
+    let nested = tool
+      .projectRoots(ws, absolutePath)
+      .filter { root => root != path and (path == "." or root.hasPrefix(globPrefix)) }
+    let empty: [String!]! = []
+    let found = (specs ?? ["./test"]).reduce(empty) { acc, spec =>
+      acc + specFiles(ws, spec, extensions ?? ["js", "cjs", "mjs"], recursive)
+    }
+    tool.sorted(
+      found
+        .filter { file =>
+          ("/" + file).contains("/node_modules/") == false
+            and nested.any { root => (globPrefix + file).hasPrefix(root + "/") } == false
+        }
+        .uniq,
+    )
+  }
+
+  """
+  Project-relative files matched by one spec entry. A glob matches files; a
+  plain path names a file, or a directory whose files with the given
+  extensions it holds (at any depth when recursive), as Mocha reads it.
+  """
+  let specFiles(
+    ws: Workspace!,
+    spec: String!,
+    extensions: [String!]!,
+    recursive: Boolean!,
+  ): [String!]! {
+    let empty: [String!]! = []
+    let relative = spec.trimPrefix("./").trimSuffix("/")
+    if (relative == "" or relative.hasPrefix("/") or relative.hasPrefix("..")) {
+      # Outside the project: not a key it can offer.
+      empty
+    } else {
+      expandBraces(relative).reduce(empty) { acc, pattern =>
+        let matches = globFiles(ws, pattern)
+        if (pattern.containsMatch(`[*?\[]`)) {
+          acc + matches.filter { m => m.hasSuffix("/") == false }
+        } else if (matches.contains(pattern + "/")) {
+          let exts = extensions.map { ext => "." + ext.trimPrefix(".") }
+          let depth = if (recursive) { "/**" } else { "/*" }
+          acc + globFiles(ws, pattern + depth)
+            .filter { m => exts.any { ext => m.hasSuffix(ext) } }
+        } else {
+          acc + matches.filter { m => m == pattern }
+        }
+      }
+    }
+  }
+
+  """
+  Workspace glob of a project-relative pattern, as project-relative paths.
+  Directories keep a trailing slash.
+  """
+  let globFiles(ws: Workspace!, pattern: String!): [String!]! {
+    ws.glob(globPrefix + pattern).map { m =>
+      m.trimPrefix("/").trimPrefix("./").trimPrefix(globPrefix)
+    }
+  }
+
+  """
+  A glob with its brace alternatives spelled out, which Workspace.glob does
+  not expand: "test/*.{js,ts}" is "test/*.js" and "test/*.ts".
+  """
+  let expandBraces(pattern: String!): [String!]! {
+    let group = pattern.match(`\{([^{}]*)\}`)
+    if (group == null) {
+      [pattern]
+    } else {
+      let around = pattern.splitMatches(`\{[^{}]*\}`, limit: 2)
+      let empty: [String!]! = []
+      (group.captures ?? empty).takeFirst(1).join("").split(",").reduce(empty) { acc, alt =>
+        acc + expandBraces(around.takeFirst(1).join("") + alt + around.dropFirst(1).join(""))
+      }
+    }
+  }
+
+  """
+  The config file Mocha loads for this project, in Mocha's own lookup order,
+  as JSON or YAML text; null when there is none or it is JavaScript.
+  """
+  let configText(ws: Workspace!): String {
+    let present = ws.glob(globPrefix + ".mocharc.*").map { m =>
+      m.trimPrefix("/").trimPrefix("./").trimPrefix(globPrefix)
+    }
+    let loaded = [
+      ".mocharc.cjs",
+      ".mocharc.js",
+      ".mocharc.yaml",
+      ".mocharc.yml",
+      ".mocharc.jsonc",
+      ".mocharc.json",
+    ].filter { name => present.contains(name) }.takeFirst(1).join("")
+    if (loaded == "" or loaded.hasSuffix("js")) {
+      null
+    } else {
+      let text = ws.file("/" + globPrefix + loaded).contents
+      if (loaded.hasSuffix(".yaml") or loaded.hasSuffix(".yml")) {
+        text
+      } else {
+        # Mocha strips comments from JSON configs. What is left is YAML too,
+        # once tabs, which JSON only allows as whitespace, are spaces.
+        text
+          .replaceMatches(`(?s)/\*.*?\*/`, with: "")
+          .replaceMatches(`(?m)(^|\s)//.*$`, with: "")
+          .replace("\t", " ")
+      }
+    }
+  }
+
+  """
+  The config's spec, as a list whether Mocha was given a string or a list;
+  null when it is unset or neither.
+  """
+  let specOption(text: String!): [String!] {
+    {
+      let config = YAML.decode(text) :: {{spec: [String!]}}!
+      config.spec
+    } rescue {
+      err: Error => {
+        let config = YAML.decode(text) :: {{spec: String}}!
+        if (config.spec == null) { null } else { [config.spec ?? ""] }
+      } rescue {
+        err: Error => null
+      }
+    }
+  }
+
+  """
+  The config's test file extensions, as a list whether Mocha was given a
+  string or a list; null when it is unset or neither.
+  """
+  let extensionOption(text: String!): [String!] {
+    {
+      let config = YAML.decode(text) :: {{extension: [String!]}}!
+      config.extension
+    } rescue {
+      err: Error => {
+        let config = YAML.decode(text) :: {{extension: String}}!
+        if (config.extension == null) { null } else { [config.extension ?? ""] }
+      } rescue {
+        err: Error => null
+      }
+    }
+  }
+
+  """
+  Whether the config asks Mocha to read spec directories recursively.
+  """
+  let recursiveOption(text: String!): Boolean! {
+    {
+      let config = YAML.decode(text) :: {{recursive: Boolean}}!
+      config.recursive ?? false
+    } rescue {
+      err: Error => false
+    }
+  }
+}
+
+"""
+Test files in a Mocha project, keyed by project-relative path.
+"""
+type MochajsTestFiles @collection {
+  """
+  Test file paths, relative to the project root.
+  """
+  files: [String!]! @keys
+
+  """
+  Test files selected in or out since the collection was discovered.
+  """
+  delta: CollectionDelta
+
+  let project: MochajsProject!
+
+  """
+  The test file at this path.
+  """
+  file(path: String!): MochajsTestFile! @get {
+    MochajsTestFile(path: path, project: project)
+  }
+
+  """
+  Run the selected test files in this project.
+  """
+  test(ws: Workspace!): Void @check {
+    # With nothing selected out, run the project as Mocha's own config selects
+    # it rather than naming every file. Without a delta, naming the files is
+    # the safe choice.
+    let whole = if (delta == null) {
+      false
+    } else {
+      delta.addedKeys.length == 0 and delta.removedKeys.length == 0
+    }
+    if (whole) {
+      project.test(ws)
+    } else if (files.length > 0) {
+      project.runFiles(ws, files)
+    }
+    null
+  }
+}
+
+"""
+A Mocha test file.
+"""
+type MochajsTestFile {
+  """
+  Test file path, relative to the project root.
+  """
+  path: String!
+
+  let project: MochajsProject!
+
+  """
+  Run this test file.
+  """
+  test(ws: Workspace!): Void @check {
+    project.runFiles(ws, [path])
   }
 }

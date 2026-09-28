@@ -1,10 +1,9 @@
 name = "mochajs"
-engineVersion = "v1.0.0-beta.10"
+engineVersion = "v1.0.0-beta.14"
 
 [runtime]
   source = "dang"
 
 [[dependencies]]
   name = "nodejs"
-  source = "github.com/dagger/node@main"
-  pin = "88bcb3525b0ed015d13c08bc7c27570d5453dc65"
+  source = "github.com/dagger/node@v0.2.0"

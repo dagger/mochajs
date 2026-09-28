@@ -12,11 +12,14 @@ source = "github.com/dagger/dang-sdk"
 [modules.e2e]
 source = ".dagger/modules/e2e"
 
-[modules.dagger-dang-sdk.as-sdk]
-name = "dang"
+[sdks.dang]
+module = "dagger-dang-sdk"
 
-[[modules.dagger-dang-sdk.as-sdk.modules]]
-path = "."
+[sdks.dang.scopes."."]
+clients = ["github.com/dagger/node"]
+is-module = true
+name = "mochajs"
 
-[[modules.dagger-dang-sdk.as-sdk.modules]]
-path = ".dagger/modules/e2e"
+[sdks.dang.scopes.".dagger/modules/e2e"]
+clients = ["./."]
+is-module = true

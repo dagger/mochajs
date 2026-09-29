@@ -25,28 +25,31 @@ The module has one check, `test`, and it runs per test file. Its address is
 | `--mochajs-project=PATH` | a project, by its root relative to the workspace root (repeatable) |
 | `--mochajs-test-file=PATH` | a test file, by its path relative to the project root (repeatable) |
 | `--mochajs`, `--by-mochajs` | this module's checks |
-| `--test`, `--check-test` | checks named `test`, in every installed module |
+| `--check test` | checks named `test`, in every installed module |
 
 ```console
 $ dagger check -l --all --mochajs                  # one line per project and test file
-$ dagger check --mochajs --test                    # every project, each run whole
-$ dagger check --mochajs --test --mochajs-project=api
-$ dagger check --mochajs --test --mochajs-project=api --mochajs-test-file=test/unit/t1.spec.js
+$ dagger check --mochajs                           # every project, each run whole
+$ dagger check --mochajs --mochajs-project=api
+$ dagger check --mochajs --mochajs-project=api --mochajs-test-file=test/unit/t1.spec.js
 $ dagger check mochajs/projects/tests/test --mochajs-project=api   # the same, by path
 $ dagger list mochajs-projects -a
 $ dagger list mochajs-test-files -a --mochajs-project=api
 ```
 
-`--test` alone also selects every other installed module's check named `test`;
-`--mochajs` narrows it to this one. When another installed module also has a
-`MochajsProject` or `MochajsTestFile` type, the flags take a qualified name;
-`dagger check --help` lists the flags in effect.
+`--check test` alone also selects every other installed module's check named
+`test`; `--mochajs` narrows it to this one. When another installed module also
+has a `MochajsProject` or `MochajsTestFile` type, the flags take a qualified
+name; `dagger check --help` lists the flags in effect.
 
 `test` runs once per selected project. With every test file of a project
 selected, it runs `npx mocha` in the project root, and the project's own Mocha
 config selects the tests. With some files filtered out, it runs only the
 selected files: the project's config still applies, minus its `spec`, which
-Mocha would otherwise add to the files named on the command line.
+Mocha would otherwise add to the files named on the command line. To load that
+config, a filtered run uses Mocha's own loaders from `mocha/lib/cli/options.cjs`
+(Mocha 12), falling back to `mocha/lib/cli/options` (Mocha 9–11). It is tested
+with Mocha 11 and 12.
 
 ## Selecting by directory
 

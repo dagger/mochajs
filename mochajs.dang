@@ -231,12 +231,22 @@ type MochajsProject {
 
   """
   A Mocha config that loads the project's own config the way Mocha would,
-  minus its spec. Mocha adds the configured spec to any files named on the
-  command line, so running only the named files means dropping it.
+  through Mocha's own loaders (lib/cli/options in Mocha 9-11, options.cjs in
+  Mocha 12), minus its spec. Mocha adds the configured spec to any files named
+  on the command line, so running only the named files means dropping it.
   """
   let filesConfig: String! = ```
   const paths = [process.cwd()];
-  const { loadRc, loadPkgRc } = require(require.resolve("mocha/lib/cli/options", { paths }));
+  // Mocha 12 is ESM and names its CommonJS internals .cjs, which require does
+  // not try on its own; Mocha 9-11 ship lib/cli/options.js.
+  const optionsPath = (() => {
+    try {
+      return require.resolve("mocha/lib/cli/options.cjs", { paths });
+    } catch {
+      return require.resolve("mocha/lib/cli/options", { paths });
+    }
+  })();
+  const { loadRc, loadPkgRc } = require(optionsPath);
   const rc = loadRc() || {};
   const pkg = loadPkgRc() || {};
   const config = { ...pkg };

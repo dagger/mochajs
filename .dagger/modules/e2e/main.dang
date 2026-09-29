@@ -421,6 +421,33 @@ type E2E {
   }
 
   """
+  Mocha 12 is ESM and renamed the config loaders a filtered run borrows, so a
+  filtered run is checked against it too: the ESM sample project, its
+  `.mocharc.json` spec, and a failing file that only the whole run reaches.
+  """
+  mocha12Check: Void @check {
+    let ws = esmProject
+      .withNewFile(
+        "package.json",
+        "{\"name\": \"mocha-fixture-esm-12\", \"private\": true, \"type\": \"module\", \"devDependencies\": {\"mocha\": \"^12.0.2\"}}\n",
+      )
+      .withNewFile(
+        "test/broken.test.js",
+        "import assert from \"node:assert\";\n\ndescribe(\"broken\", () => {\n  it(\"fails\", () => {\n    assert.equal(1, 2);\n  });\n});\n",
+      )
+      .asWorkspace
+    let tests = mochajs.projects(ws).get(key: ".").tests(ws)
+    assert(
+      tests.keys == ["test/broken.test.js", "test/index.test.js"],
+      "test files: " + tests.keys.join(", "),
+    )
+    run(tests.get(key: "test/index.test.js").test(ws))
+    run(tests.subset(keys: ["test/index.test.js"]).batch.test(ws))
+    assert(failed(tests.batch.test(ws)), "the whole project run missed the failing file")
+    null
+  }
+
+  """
   Settings apply to every run: flags reach Mocha whether the project runs
   whole or file by file.
   """

@@ -293,7 +293,9 @@ type Mochajs {
       .withExec(["bun", "install"])
       .withExec(["bun", "run", "build"])
       .withExec(["rm", "-rf", "node_modules"])
-      .withExec(["bun", "install", "--production"])
+      # Mocha is a peer: the instrumentation patches the project's own, so the
+      # library must not bring one.
+      .withExec(["bun", "install", "--production", "--omit=peer"])
       .directory("/src")
       .filter(include: ["dist", "node_modules", "package.json"])
   }
@@ -460,7 +462,7 @@ type MochajsProject {
       ran.stderr.trim(" \n")
     } else if (code == 124) {
       step + " did not finish within " + toString(tool.timeout)
-        + "s. A run that hangs after its tests finish usually leaves handles open: set flags to [\"--exit\"], or exit: true in the Mocha config."
+        + "s. If its tests had finished and the process kept running, something left a handle open (a server, a connection, a timer): set flags to [\"--exit\"], or exit: true in the Mocha config. Otherwise raise the timeout setting."
     } else {
       let output = (ran.stdout.trim(" \n") + "\n" + ran.stderr.trim(" \n")).trim(" \n")
       step + " failed (exit " + toString(code) + "):\n" + output.split("\n").takeLast(15).join("\n")

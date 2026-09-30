@@ -54,6 +54,182 @@ type E2E {
   }
 
   """
+  The failure of a check, or "passed".
+  """
+  let outcome(check: Check!): String! {
+    {
+      run(check)
+      "passed"
+    } rescue {
+      err: Error => err.message
+    }
+  }
+
+  """
+  Run every test file of the only project in a workspace, as one whole-project
+  batch, and report its outcome.
+  """
+  let wholeOutcome(tool: Mochajs!, ws: Workspace!, key: String!): String! {
+    outcome(tool.projects(ws).get(key: key).tests(ws).batch.test(ws))
+  }
+
+  """
+  A package.json for a sample project.
+  """
+  let packageJson(type: String!, mocha: String!, extra: String!): String! {
+    "{\"name\": \"fixture\", \"private\": true, \"type\": \"" + type
+      + "\", \"devDependencies\": {\"mocha\": \"" + mocha + "\"}" + extra + "}\n"
+  }
+
+  """
+  A test that passes only when Mocha's Runner is the instrumented one, which
+  is how the spans get recorded.
+  """
+  let probeCjs: String! =
+    "const m = require(\"mocha\");\nconst assert = require(\"node:assert\");\n\ndescribe(\"dagger\", () => {\n  it(\"instruments mocha\", () => {\n    assert.strictEqual((m.default ?? m).Runner.__dagger_instrumented__, true);\n  });\n});\n"
+
+  let probeEsm: String! =
+    "import Mocha from \"mocha\";\nimport assert from \"node:assert\";\n\ndescribe(\"dagger\", () => {\n  it(\"instruments mocha\", () => {\n    assert.strictEqual(Mocha.Runner.__dagger_instrumented__, true);\n  });\n});\n"
+
+  """
+  The OpenTelemetry instrumentation patches Mocha 11 and Mocha 12, CommonJS
+  and ESM: Mocha 12's CLI loads lib/mocha.cjs, which the hook has to match.
+  """
+  instrumentationCheck: Void @check {
+    let cjs11 = cjsProject.withNewFile("test/probe.test.js", probeCjs)
+    let esm11 = esmProject.withNewFile("test/probe.test.js", probeEsm)
+    let cjs12 = cjs11.withNewFile("package.json", packageJson(
+      "commonjs",
+      "^12.0.2",
+      "",
+    ))
+    let esm12 = esm11.withNewFile("package.json", packageJson(
+      "module",
+      "^12.0.2",
+      "",
+    ))
+    let results = [
+      "cjs 11: " + wholeOutcome(mochajs, cjs11.asWorkspace, "."),
+      "esm 11: " + wholeOutcome(mochajs, esm11.asWorkspace, "."),
+      "cjs 12: " + wholeOutcome(mochajs, cjs12.asWorkspace, "."),
+      "esm 12: " + wholeOutcome(mochajs, esm12.asWorkspace, "."),
+    ]
+    assert(
+      results.all { r => r.hasSuffix(": passed") },
+      "instrumentation: " + results.join("; "),
+    )
+    null
+  }
+
+  """
+  A run that never finishes is stopped at the timeout and says why; --exit
+  lets Mocha end a run whose tests leave handles open.
+  """
+  timeoutCheck: Void @check {
+    let ws = cjsProject
+      .withNewFile("test/hang.test.js", "setInterval(() => {}, 1000);\n")
+      .asWorkspace
+    let hung = wholeOutcome(mochajs(timeout: 5), ws, ".")
+    assert(hung.contains("did not finish within 5s"), "hanging run: " + hung)
+    assert(hung.contains("--exit"), "the timeout did not suggest --exit: " + hung)
+    let exited = wholeOutcome(mochajs(timeout: 60, flags: ["--exit"]), ws, ".")
+    assert(exited == "passed", "run with --exit: " + exited)
+    null
+  }
+
+  """
+  The environment setting reaches the tests, and browser downloads are
+  skipped.
+  """
+  environmentCheck: Void @check {
+    let ws = cjsProject
+      .withNewFile(
+        "test/env.test.js",
+        "const assert = require(\"node:assert\");\n\nit(\"sees the env setting\", () => {\n  assert.strictEqual(process.env.E2E_GREETING, \"hello=world\");\n  assert.strictEqual(process.env.PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD, \"1\");\n});\n",
+      )
+      .asWorkspace
+    let without = wholeOutcome(mochajs, ws, ".")
+    assert(without != "passed", "the environment test passed without the setting")
+    let given = wholeOutcome(
+      mochajs(environment: ["E2E_GREETING=hello=world"]),
+      ws,
+      ".",
+    )
+    assert(given == "passed", "environment setting: " + given)
+    null
+  }
+
+  """
+  Install failures name the step and the command; installFlags reach it.
+  """
+  installCheck: Void @check {
+    let ws = cjsProject
+      .withNewFile(
+        "package.json",
+        packageJson("commonjs", "^11.7.5", ", \"scripts\": {\"postinstall\": \"exit 3\"}"),
+      )
+      .asWorkspace
+    let broken = wholeOutcome(mochajs, ws, ".")
+    assert(
+      broken.contains("install failed (npm install, exit"),
+      "a failing install was not named: " + broken,
+    )
+    let ignored = wholeOutcome(
+      mochajs(installFlags: ["--ignore-scripts"]),
+      ws,
+      ".",
+    )
+    assert(ignored == "passed", "installFlags: " + ignored)
+
+    let missing = cjsProject
+      .withNewFile("package.json", "{\"name\": \"fixture\", \"private\": true}\n")
+      .asWorkspace
+    let notInstalled = wholeOutcome(mochajs, missing, ".")
+    assert(
+      notInstalled.contains("mocha is not installed"),
+      "a project without mocha: " + notInstalled,
+    )
+    null
+  }
+
+  """
+  Dependencies install at the workspace root, so a package can use its
+  workspace siblings, and the package manager is detected from package.json.
+  """
+  packageManagerCheck: Void @check {
+    let npmWorkspaces = directory
+      .withNewFile(
+        "package.json",
+        "{\"name\": \"root\", \"private\": true, \"workspaces\": [\"packages/*\"], \"devDependencies\": {\"mocha\": \"^11.7.5\"}}\n",
+      )
+      .withNewFile("packages/b/package.json", "{\"name\": \"b\", \"version\": \"1.0.0\", \"main\": \"index.js\"}\n")
+      .withNewFile("packages/b/index.js", "module.exports = 42;\n")
+      .withNewFile("packages/a/package.json", "{\"name\": \"a\", \"version\": \"1.0.0\"}\n")
+      .withNewFile("packages/a/.mocharc.json", "{\"spec\": \"test/*.test.js\"}\n")
+      .withNewFile(
+        "packages/a/test/sibling.test.js",
+        "const assert = require(\"node:assert\");\n\nit(\"uses a workspace sibling\", () => {\n  assert.strictEqual(require(\"b\"), 42);\n});\n",
+      )
+      .asWorkspace
+    let sibling = wholeOutcome(mochajs, npmWorkspaces, "packages/a")
+    assert(sibling == "passed", "npm workspaces: " + sibling)
+
+    let pnpm = cjsProject
+      .withNewFile(
+        "package.json",
+        packageJson("commonjs", "^11.7.5", ", \"packageManager\": \"pnpm@9.15.0\""),
+      )
+      .withNewFile(
+        "test/pnpm.test.js",
+        "const assert = require(\"node:assert\");\nconst fs = require(\"node:fs\");\n\nit(\"was installed by pnpm\", () => {\n  assert.ok(fs.existsSync(\"node_modules/.pnpm\"));\n});\n",
+      )
+      .asWorkspace
+    let detected = wholeOutcome(mochajs, pnpm, ".")
+    assert(detected == "passed", "pnpm from packageManager: " + detected)
+    null
+  }
+
+  """
   Run the toolchain against the sample projects, exercising the real thing:
   discovery, the local build of the otel library, and a Mocha run under both
   module systems, of a whole project and of a single test file.

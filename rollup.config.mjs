@@ -12,7 +12,10 @@ const external = (id) =>
   id === "fs" ||
   id === "path" ||
   id === "crypto" ||
-  id === "require-in-the-middle";
+  id === "require-in-the-middle" ||
+  // the project's own Mocha is instrumented, never a bundled copy
+  id === "mocha" ||
+  id.startsWith("mocha/");
 
 const registerConfig = {
   input: "src/register.ts",

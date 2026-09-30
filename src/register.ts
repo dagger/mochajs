@@ -2,41 +2,36 @@
 
 import { Hook } from "require-in-the-middle";
 
-import { InstrumentedRunner } from "./instrumented_runner";
+import { instrumentRunner, type RunnerClass } from "./instrumented_runner";
 
 function patchMocha(mochaExports: any) {
-  if (!mochaExports || !mochaExports.Runner) {
+  const OriginalRunner: RunnerClass | undefined = mochaExports?.Runner;
+  if (!OriginalRunner || OriginalRunner.__dagger_instrumented__) {
     return mochaExports;
   }
 
-  const OriginalRunner = mochaExports.Runner;
-
-  // Avoid double patching
-  if ((OriginalRunner as InstrumentedRunner).__dagger_instrumented__) {
+  // An ES module namespace (Mocha 12's `mocha` entry point, required from
+  // CommonJS) is read-only; the CommonJS module behind it is patched instead.
+  const desc = Object.getOwnPropertyDescriptor(mochaExports, "Runner");
+  if (desc && !desc.writable && !desc.set) {
     return mochaExports;
   }
 
-  // Preserve static properties if Mocha sets any on Runner
-  for (const key of Object.getOwnPropertyNames(OriginalRunner)) {
-    if (["prototype", "name", "length"].includes(key)) continue;
-    try {
-      const desc = Object.getOwnPropertyDescriptor(OriginalRunner, key);
-      if (desc) Object.defineProperty(InstrumentedRunner, key, desc);
-    } catch {
-      // non-critical
-    }
-  }
-
-  mochaExports.Runner = InstrumentedRunner;
+  mochaExports.Runner = instrumentRunner(OriginalRunner);
 
   return mochaExports;
 }
 
-// Hook CommonJS require('mocha') and require('mocha/lib/mocha')
+// Hook require('mocha') and Mocha's own entry file: lib/mocha.js up to Mocha
+// 11, lib/mocha.cjs from Mocha 12, which its CLI requires as "../mocha.cjs".
 new Hook(["mocha"], { internals: true }, (exports: any, name: string) => {
   try {
-    // Hook the main mocha export OR the mocha.js internal file
-    if (name === "mocha" || name.endsWith("/mocha.js") || name.endsWith("/lib/mocha")) {
+    if (
+      name === "mocha" ||
+      name.endsWith("/mocha.js") ||
+      name.endsWith("/mocha.cjs") ||
+      name.endsWith("/lib/mocha")
+    ) {
       return patchMocha(exports);
     }
     return exports;

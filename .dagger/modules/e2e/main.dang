@@ -23,15 +23,304 @@ type E2E {
     currentModule.source.directory("modules/esm")
   }
 
+  let assert(condition: Boolean!, message: String!): Void {
+    if (condition == false) {
+      raise message
+    }
+    null
+  }
+
+  """
+  Run a check, raising its failure. A check called through a dependency comes
+  back as a Check that has not run.
+  """
+  let run(check: Check!): Void {
+    # Check.error is not null for a passing check when read from Dang, so ask
+    # pass first and read the message only on failure.
+    if (check.pass == false) {
+      raise check.error.message ?? "check failed"
+    }
+    null
+  }
+
+  """
+  Whether a check failed when run.
+  """
+  let failed(check: Check!): Boolean! {
+    {
+      run(check)
+      false
+    } rescue true
+  }
+
+  """
+  The failure of a check, or "passed".
+  """
+  let outcome(check: Check!): String! {
+    {
+      run(check)
+      "passed"
+    } rescue {
+      err: Error => err.message
+    }
+  }
+
+  """
+  Run every test file of the only project in a workspace, as one whole-project
+  batch, and report its outcome.
+  """
+  let wholeOutcome(tool: Mochajs!, ws: Workspace!, key: String!): String! {
+    outcome(tool.projects(ws).get(key: key).tests(ws).batch.test(ws))
+  }
+
+  """
+  A package.json for a sample project.
+  """
+  let packageJson(type: String!, mocha: String!, extra: String!): String! {
+    "{\"name\": \"fixture\", \"private\": true, \"type\": \"" + type
+      + "\", \"devDependencies\": {\"mocha\": \"" + mocha + "\"}" + extra + "}\n"
+  }
+
+  """
+  A test that passes only when Mocha's Runner is the instrumented one, which
+  is how the spans get recorded.
+  """
+  let probeCjs: String! =
+    "const m = require(\"mocha\");\nconst assert = require(\"node:assert\");\n\ndescribe(\"dagger\", () => {\n  it(\"instruments mocha\", () => {\n    assert.strictEqual((m.default ?? m).Runner.__dagger_instrumented__, true);\n  });\n});\n"
+
+  let probeEsm: String! =
+    "import Mocha from \"mocha\";\nimport assert from \"node:assert\";\n\ndescribe(\"dagger\", () => {\n  it(\"instruments mocha\", () => {\n    assert.strictEqual(Mocha.Runner.__dagger_instrumented__, true);\n  });\n});\n"
+
+  """
+  The OpenTelemetry instrumentation patches Mocha 11 and Mocha 12, CommonJS
+  and ESM: Mocha 12's CLI loads lib/mocha.cjs, which the hook has to match.
+  """
+  instrumentationCheck: Void @check {
+    let cjs11 = cjsProject.withNewFile("test/probe.test.js", probeCjs)
+    let esm11 = esmProject.withNewFile("test/probe.test.js", probeEsm)
+    let cjs12 = cjs11.withNewFile("package.json", packageJson(
+      "commonjs",
+      "^12.0.2",
+      "",
+    ))
+    let esm12 = esm11.withNewFile("package.json", packageJson(
+      "module",
+      "^12.0.2",
+      "",
+    ))
+    let results = [
+      "cjs 11: " + wholeOutcome(mochajs, cjs11.asWorkspace, "."),
+      "esm 11: " + wholeOutcome(mochajs, esm11.asWorkspace, "."),
+      "cjs 12: " + wholeOutcome(mochajs, cjs12.asWorkspace, "."),
+      "esm 12: " + wholeOutcome(mochajs, esm12.asWorkspace, "."),
+    ]
+    assert(
+      results.all { r => r.hasSuffix(": passed") },
+      "instrumentation: " + results.join("; "),
+    )
+    null
+  }
+
+  """
+  A run that never finishes is stopped at the timeout and says why; --exit
+  lets Mocha end a run whose tests leave handles open.
+  """
+  timeoutCheck: Void @check {
+    let ws = cjsProject
+      .withNewFile("test/hang.test.js", "setInterval(() => {}, 1000);\n")
+      .asWorkspace
+    let hung = wholeOutcome(mochajs(timeout: 5), ws, ".")
+    assert(hung.contains("did not finish within 5s"), "hanging run: " + hung)
+    assert(hung.contains("--exit"), "the timeout did not suggest --exit: " + hung)
+    let exited = wholeOutcome(mochajs(timeout: 60, flags: ["--exit"]), ws, ".")
+    assert(exited == "passed", "run with --exit: " + exited)
+    null
+  }
+
+  """
+  The environment setting reaches the tests, and browser downloads are
+  skipped.
+  """
+  environmentCheck: Void @check {
+    let ws = cjsProject
+      .withNewFile(
+        "test/env.test.js",
+        "const assert = require(\"node:assert\");\n\nit(\"sees the env setting\", () => {\n  assert.strictEqual(process.env.E2E_GREETING, \"hello=world\");\n  assert.strictEqual(process.env.PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD, \"1\");\n});\n",
+      )
+      .asWorkspace
+    let without = wholeOutcome(mochajs, ws, ".")
+    assert(without != "passed", "the environment test passed without the setting")
+    let given = wholeOutcome(
+      mochajs(environment: ["E2E_GREETING=hello=world"]),
+      ws,
+      ".",
+    )
+    assert(given == "passed", "environment setting: " + given)
+    null
+  }
+
+  """
+  Install failures name the step and the command; installFlags reach it.
+  """
+  installCheck: Void @check {
+    let ws = cjsProject
+      .withNewFile(
+        "package.json",
+        packageJson("commonjs", "^11.7.5", ", \"scripts\": {\"postinstall\": \"exit 3\"}"),
+      )
+      .asWorkspace
+    let broken = wholeOutcome(mochajs, ws, ".")
+    assert(
+      broken.contains("install failed (npm install, exit"),
+      "a failing install was not named: " + broken,
+    )
+    let ignored = wholeOutcome(
+      mochajs(installFlags: ["--ignore-scripts"]),
+      ws,
+      ".",
+    )
+    assert(ignored == "passed", "installFlags: " + ignored)
+
+    let missing = cjsProject
+      .withNewFile("package.json", "{\"name\": \"fixture\", \"private\": true}\n")
+      .asWorkspace
+    let notInstalled = wholeOutcome(mochajs, missing, ".")
+    assert(
+      notInstalled.contains("mocha is not installed"),
+      "a project without mocha: " + notInstalled,
+    )
+    null
+  }
+
+  """
+  pnpm copies file: dependencies at install time, so their files are install
+  inputs too, not only their package.json.
+  """
+  localDependencyCheck: Void @check {
+    let ws = cjsProject
+      .withNewFile(
+        "package.json",
+        packageJson(
+          "commonjs",
+          "^11.7.5",
+          ", \"packageManager\": \"pnpm@12.8.1\", \"dependencies\": {\"local-dep\": \"file:./local-dep\"}",
+        ),
+      )
+      .withNewFile("local-dep/package.json", "{\"name\": \"local-dep\", \"version\": \"1.0.0\", \"main\": \"index.js\"}\n")
+      .withNewFile("local-dep/index.js", "module.exports = 7;\n")
+      .withNewFile(
+        "test/local.test.js",
+        "const assert = require(\"node:assert\");\n\nit(\"uses a file: dependency\", () => {\n  assert.strictEqual(require(\"local-dep\"), 7);\n});\n",
+      )
+      .asWorkspace
+    let result = wholeOutcome(mochajs, ws, ".")
+    assert(result == "passed", "file: dependency: " + result)
+    null
+  }
+
+  """
+  A workspace package's "bin" is linked into node_modules/.bin, so a test can
+  run the CLI: the install sees the bin file, not only the manifests. pnpm 10
+  skips the link when the file is missing; pnpm 12 links it anyway.
+  """
+  workspaceBinCheck: Void @check {
+    let ws = directory
+      .withNewFile(
+        "package.json",
+        "{\"name\": \"root\", \"private\": true, \"packageManager\": \"pnpm@10.18.3\", \"devDependencies\": {\"mocha\": \"^11.7.5\", \"hello-cli\": \"workspace:*\"}}\n",
+      )
+      .withNewFile("pnpm-workspace.yaml", "packages:\n  - packages/*\n")
+      .withNewFile(
+        "packages/hello-cli/package.json",
+        "{\"name\": \"hello-cli\", \"version\": \"1.0.0\", \"bin\": {\"hello-cli\": \"bin/hello.js\"}}\n",
+      )
+      .withNewFile("packages/hello-cli/bin/hello.js", "#!/usr/bin/env node\nconsole.log(\"hello\");\n")
+      .withNewFile(".mocharc.json", "{\"spec\": \"test/*.test.js\"}\n")
+      .withNewFile(
+        "test/cli.test.js",
+        "const assert = require(\"node:assert\");\nconst { execFileSync } = require(\"node:child_process\");\n\nit(\"runs a workspace CLI\", () => {\n  assert.strictEqual(execFileSync(\"node_modules/.bin/hello-cli\").toString().trim(), \"hello\");\n});\n",
+      )
+      .asWorkspace
+    let result = wholeOutcome(mochajs, ws, ".")
+    assert(result == "passed", "workspace bin: " + result)
+    null
+  }
+
+  """
+  Tests may delete globals the exporter could use (fetch, ReadableStream,
+  TextEncoder); the instrumentation must not turn that into a failed run.
+  """
+  mutatedGlobalsCheck: Void @check {
+    let ws = cjsProject
+      .withNewFile(
+        "test/globals.test.js",
+        "const assert = require(\"node:assert\");\n\ndescribe(\"globals\", () => {\n  afterEach(() => {\n    delete globalThis.ReadableStream;\n    delete globalThis.fetch;\n    delete globalThis.Request;\n    delete globalThis.Response;\n    delete globalThis.Headers;\n  });\n  after(() => {\n    delete globalThis.TextEncoder;\n    delete globalThis.TextDecoder;\n  });\n  for (let i = 0; i < 5; i++) {\n    it(\"test \" + i, async () => {\n      await new Promise((resolve) => setTimeout(resolve, 20));\n      assert.ok(true);\n    });\n  }\n});\n",
+      )
+      .asWorkspace
+    let result = wholeOutcome(mochajs, ws, ".")
+    assert(result == "passed", "mutated globals: " + result)
+    null
+  }
+
+  """
+  Dependencies install at the workspace root, so a package can use its
+  workspace siblings, and the package manager is detected from package.json.
+  """
+  packageManagerCheck: Void @check {
+    let npmWorkspaces = directory
+      .withNewFile(
+        "package.json",
+        "{\"name\": \"root\", \"private\": true, \"workspaces\": [\"packages/*\"], \"devDependencies\": {\"mocha\": \"^11.7.5\"}}\n",
+      )
+      .withNewFile("packages/b/package.json", "{\"name\": \"b\", \"version\": \"1.0.0\", \"main\": \"index.js\"}\n")
+      .withNewFile("packages/b/index.js", "module.exports = 42;\n")
+      .withNewFile("packages/a/package.json", "{\"name\": \"a\", \"version\": \"1.0.0\"}\n")
+      .withNewFile("packages/a/.mocharc.json", "{\"spec\": \"test/*.test.js\"}\n")
+      .withNewFile(
+        "packages/a/test/sibling.test.js",
+        "const assert = require(\"node:assert\");\n\nit(\"uses a workspace sibling\", () => {\n  assert.strictEqual(require(\"b\"), 42);\n});\n",
+      )
+      .asWorkspace
+    let sibling = wholeOutcome(mochajs, npmWorkspaces, "packages/a")
+    assert(sibling == "passed", "npm workspaces: " + sibling)
+
+    let pnpm = cjsProject
+      .withNewFile(
+        "package.json",
+        packageJson("commonjs", "^11.7.5", ", \"packageManager\": \"pnpm@12.8.1\""),
+      )
+      .withNewFile(
+        "test/pnpm.test.js",
+        "const assert = require(\"node:assert\");\nconst fs = require(\"node:fs\");\n\nit(\"was installed by pnpm\", () => {\n  assert.ok(fs.existsSync(\"node_modules/.pnpm\"));\n});\n",
+      )
+      .asWorkspace
+    let detected = wholeOutcome(mochajs, pnpm, ".")
+    assert(detected == "passed", "pnpm from packageManager: " + detected)
+    null
+  }
+
   """
   Run the toolchain against the sample projects, exercising the real thing:
   discovery, the local build of the otel library, and a Mocha run under both
-  module systems.
+  module systems, of a whole project and of a single test file.
   """
   sampleProjectsCheck: Void @check {
-    mochajs.testAll(cjsProject.asWorkspace)
-    mochajs.testAll(esmProject.asWorkspace)
+    testSample(cjsProject)
+    testSample(esmProject)
 
+    null
+  }
+
+  let testSample(project: Directory!): Void {
+    let ws = project.asWorkspace
+    let projects = mochajs.projects(ws)
+    assertPaths(projects.keys, ["."], "sample project discovery")
+    projects.batch.test(ws)
+
+    let tests = projects.get(key: ".").tests(ws)
+    assertPaths(tests.keys, ["test/index.test.js"], "sample test file discovery")
+    run(tests.batch.test(ws))
+    run(tests.get(key: "test/index.test.js").test(ws))
     null
   }
 
@@ -39,7 +328,8 @@ type E2E {
   `list` reports the tests a project would run without running them.
   """
   listCheck: Void @check {
-    let listed = mochajs.list(cjsProject.asWorkspace)
+    let ws = cjsProject.asWorkspace
+    let listed = mochajs.projects(ws).get(key: ".").list(ws)
 
     if (listed.contains("nested suite") == false) {
       raise "list did not report the fixture's tests: " + listed
@@ -63,7 +353,7 @@ type E2E {
       .withNewFile("yml/.mocharc.yml", "{}\n")
 
     assertPaths(
-      mochajs.projects(tree.asWorkspace),
+      mochajs.projects(tree.asWorkspace).keys,
       ["js", "cjs", "mjs", "json", "jsonc", "yaml", "yml"],
       "one project per config filename",
     )
@@ -112,7 +402,7 @@ type E2E {
   Discovery from `cwd` inside a synthetic workspace built from `tree`.
   """
   let projects(tree: Directory!, cwd: String!): [String!]! {
-    mochajs.projects(tree.asWorkspace(cwd: cwd))
+    mochajs.projects(tree.asWorkspace(cwd: cwd)).keys
   }
 
   """
@@ -133,13 +423,21 @@ type E2E {
   }
 
   """
-  From a root holding no config, discovery returns every project beneath it;
-  entering one of them scopes discovery to that project alone.
+  From a directory in no project, discovery returns every project beneath it;
+  entering a project, or any directory inside it, scopes discovery to that
+  project alone. Keys are workspace-root-relative wherever the caller stands.
   """
   siblingDiscoveryCheck: Void @check {
     assertPaths(projects(siblings, "."), ["a", "b"], "from the workspace root")
-    assertPaths(projects(siblings, "a"), ["."], "from a")
-    assertPaths(projects(siblings, "b"), ["."], "from b")
+    assertPaths(projects(siblings, "a"), ["a"], "from a")
+    assertPaths(projects(siblings, "b"), ["b"], "from b")
+    assertPaths(projects(siblings, "a/test"), ["a"], "from a/test")
+
+    let grouped = directory
+      .withDirectory("apps/a", cjsProject)
+      .withDirectory("apps/b", cjsProject)
+      .withDirectory("libs/c", cjsProject)
+    assertPaths(projects(grouped, "apps"), ["apps/a", "apps/b"], "from apps")
 
     null
   }
@@ -150,24 +448,25 @@ type E2E {
   """
   nestedDiscoveryCheck: Void @check {
     assertPaths(projects(nested, "."), [".", "a", "b"], "from the workspace root")
-    assertPaths(projects(nested, "a"), ["."], "from a")
-    assertPaths(projects(nested, "b"), ["."], "from b")
+    assertPaths(projects(nested, "a"), ["a"], "from a")
+    assertPaths(projects(nested, "b"), ["b"], "from b")
 
     null
   }
 
   """
   From a subdirectory holding no config, the nearest enclosing project is
-  reported as a ".."-relative path alongside the projects below the cwd, and
-  that path resolves back to the enclosing project through the workspace.
+  reported alongside the projects below the cwd, keyed by its root rather than
+  by a ".."-relative path, and that key resolves back to the enclosing project.
   """
   ancestorDiscoveryCheck: Void @check {
     let ws = ancestor.asWorkspace(cwd: "work")
+    let found = mochajs.projects(ws)
 
-    assertPaths(mochajs.projects(ws), ["..", "app"], "from work")
+    assertPaths(found.keys, [".", "work/app"], "from work")
 
-    if (ws.directory("..").glob(".mocharc.json").length != 1) {
-      raise "the returned ancestor path did not resolve back to the enclosing project"
+    if (found.get(key: ".").source(ws).glob(".mocharc.json").length != 1) {
+      raise "the enclosing project's key did not resolve back to it"
     }
 
     null
@@ -186,54 +485,297 @@ type E2E {
   }
 
   """
+  Projects form a collection keyed by project root. get builds the project at
+  a key; subset keeps parent order, rejects unknown and duplicate keys, and
+  narrows what get accepts and what the batch runs; an empty subset is valid
+  and runs nothing.
+  """
+  collectionCheck: Void @check {
+    let ws = siblings
+      .withDirectory("c", cjsProject)
+      .withNewFile("b/test/broken.test.js", failingTest)
+      .asWorkspace
+    let all = mochajs.projects(ws)
+    assert(all.keys == ["a", "b", "c"], "keys were not sorted: " + all.keys.join(", "))
+    assert(all.get(key: "b").path == "b", "get did not return the project at its key")
+
+    let pair = all.subset(keys: ["c", "a"])
+    assert(pair.keys == ["a", "c"], "subset did not keep parent order: " + pair.keys.join(", "))
+    pair.batch.test(ws)
+
+    let outside = { pair.get(key: "b").path } rescue {
+      err: Error => "rejected"
+    }
+    assert(outside == "rejected", "get accepted a key outside the subset")
+
+    let unknown = { all.subset(keys: ["no/such/project"]).keys.join(","); "accepted" } rescue {
+      err: Error => "rejected"
+    }
+    assert(unknown == "rejected", "subset accepted an unknown key")
+
+    let duplicate = { all.subset(keys: ["a", "a"]).keys.join(","); "accepted" } rescue {
+      err: Error => "rejected"
+    }
+    assert(duplicate == "rejected", "subset accepted a duplicate key")
+
+    let none = all.subset(keys: [])
+    assert(none.keys.length == 0, "empty subset kept keys: " + none.keys.join(", "))
+    none.batch.test(ws)
+
+    let failure = { all.batch.test(ws); "unexpected success" } rescue {
+      err: Error => err.message
+    }
+    assert(failure.contains("- b:"), "batch test did not name the failing project: " + failure)
+    assert(failure.contains("- a:") == false, "batch test named a passing project: " + failure)
+    null
+  }
+
+  """
+  Test files are keyed by project-relative path, found without running Mocha:
+  the spec of a JSON or YAML config (a string or a list; globs, brace
+  alternatives, files with or without their extension, and directories),
+  `extension` and `recursive` for a directory spec, and Mocha's default
+  `./test` otherwise. A nested project's files, node_modules and empty files
+  are left out, and the keys are sorted.
+  """
+  testFileDiscoveryCheck: Void @check {
+    let ws = directory
+      .withNewFile("string/.mocharc.json", "{\"spec\": \"test/*.test.js\"}\n")
+      .withNewFile("string/test/b.test.js", testSource)
+      .withNewFile("string/test/a.test.js", testSource)
+      .withNewFile("string/test/helper.js", testSource)
+      .withNewFile("string/test/deep/c.test.js", testSource)
+      .withNewFile("globbed/.mocharc.json", "{\"spec\": [\"test/**/*.spec.js\"]}\n")
+      .withNewFile("globbed/test/unit/a.spec.js", testSource)
+      .withNewFile("globbed/test/b.spec.js", testSource)
+      .withNewFile(
+        "list/.mocharc.yaml",
+        "spec:\n  - \"unit/**/*.spec.{js,mjs}\"\n  - ./e2e/smoke.js\n  - lib/helper\n",
+      )
+      .withNewFile("list/unit/x.spec.js", testSource)
+      .withNewFile("list/unit/deep/y.spec.mjs", testSource)
+      .withNewFile("list/unit/z.spec.ts", testSource)
+      .withNewFile("list/unit/node_modules/dep/q.spec.js", testSource)
+      .withNewFile("list/e2e/smoke.js", testSource)
+      .withNewFile("list/e2e/other.js", testSource)
+      .withNewFile("list/unit/empty.spec.js", "")
+      .withNewFile("list/lib/helper.js", testSource)
+      .withNewFile(
+        "commented/.mocharc.jsonc",
+        "// Mocha strips comments\n{\n\t\"spec\": [\"spec\"], /* a directory */\n\t\"extension\": \"ts\",\n\t\"recursive\": true // and walks it\n}\n",
+      )
+      .withNewFile("commented/spec/a.ts", testSource)
+      .withNewFile("commented/spec/deep/b.ts", testSource)
+      .withNewFile("commented/spec/c.js", testSource)
+      .withNewFile("defaults/.mocharc.js", "module.exports = { spec: [\"other/*.js\"] };\n")
+      .withNewFile("defaults/test/a.js", testSource)
+      .withNewFile("defaults/test/b.cjs", testSource)
+      .withNewFile("defaults/test/c.mjs", testSource)
+      .withNewFile("defaults/test/d.ts", testSource)
+      .withNewFile("defaults/test/deep/e.js", testSource)
+      .withNewFile("defaults/other/f.js", testSource)
+      .withNewFile("outer/.mocharc.yml", "spec: \"test/**/*.js\"\n")
+      .withNewFile("outer/test/a.js", testSource)
+      .withNewFile("outer/test/inner/.mocharc.yml", "{}\n")
+      .withNewFile("outer/test/inner/test/b.js", testSource)
+      .asWorkspace
+
+    assertTestFiles(ws, "string", ["test/a.test.js", "test/b.test.js"])
+    assertTestFiles(
+      ws,
+      "list",
+      ["e2e/smoke.js", "lib/helper.js", "unit/deep/y.spec.mjs", "unit/x.spec.js"],
+    )
+    # A comment marker inside a JSON string is not a comment.
+    assertTestFiles(ws, "globbed", ["test/b.spec.js", "test/unit/a.spec.js"])
+    assertTestFiles(ws, "commented", ["spec/a.ts", "spec/deep/b.ts"])
+    assertTestFiles(ws, "defaults", ["test/a.js", "test/b.cjs", "test/c.mjs"])
+    assertTestFiles(ws, "outer", ["test/a.js"])
+    assertTestFiles(ws, "outer/test/inner", ["test/b.js"])
+
+    # Keys are relative to the project, not the caller.
+    let inside = mochajs.projects(ws.withWorkdir("string/test"))
+    assert(inside.keys == ["string"], "discovery from inside a project: " + inside.keys.join(", "))
+    assert(
+      inside.get(key: "string").tests(ws).keys == ["test/a.test.js", "test/b.test.js"],
+      "test files from inside a project",
+    )
+    null
+  }
+
+  """
+  Test file contents for discovery, which only lists non-empty files.
+  """
+  let testSource: String! = "// a test\n"
+
+  """
+  Fail unless the project at path offers exactly the wanted test files, in
+  order.
+  """
+  let assertTestFiles(ws: Workspace!, path: String!, want: [String!]!): Void {
+    let got = mochajs.projects(ws).get(key: path).tests(ws).keys
+    assert(
+      got == want,
+      path + ": got [" + got.join(", ") + "], want [" + want.join(", ") + "]",
+    )
+  }
+
+  """
+  A project's test files form a collection: with nothing filtered out, the
+  batch runs the project as Mocha's own config selects it; a subset, or one
+  file, runs only its own files, even though the config's spec covers more.
+  """
+  testFilesCheck: Void @check {
+    let ws = cjsProject.withNewFile("test/broken.test.js", failingTest).asWorkspace
+    let tests = mochajs.projects(ws).get(key: ".").tests(ws)
+    assert(
+      tests.keys == ["test/broken.test.js", "test/index.test.js"],
+      "test files: " + tests.keys.join(", "),
+    )
+
+    assert(failed(tests.batch.test(ws)), "the whole project run missed the failing file")
+    run(tests.subset(keys: ["test/index.test.js"]).batch.test(ws))
+    run(tests.get(key: "test/index.test.js").test(ws))
+    assert(
+      failed(tests.subset(keys: ["test/broken.test.js"]).batch.test(ws)),
+      "the failing file passed on its own",
+    )
+    assert(
+      failed(tests.get(key: "test/broken.test.js").test(ws)),
+      "the failing file's check passed",
+    )
+    run(tests.subset(keys: []).batch.test(ws))
+
+    # A JS config is not read, so its spec reaches a failing file discovery
+    # does not list. Only the whole run, which is Mocha's own, runs it.
+    let hidden = cjsProject
+      .withoutFile(".mocharc.json")
+      .withNewFile(
+        ".mocharc.cjs",
+        "module.exports = { spec: [\"test/*.test.js\", \"extra/*.js\"] };\n",
+      )
+      .withNewFile("extra/broken.js", failingTest)
+      .asWorkspace
+    let hiddenTests = mochajs.projects(hidden).get(key: ".").tests(hidden)
+    assert(
+      hiddenTests.keys == ["test/index.test.js"],
+      "test files under a JS config: " + hiddenTests.keys.join(", "),
+    )
+    assert(failed(hiddenTests.batch.test(hidden)), "the whole run did not use Mocha's own config")
+    run(hiddenTests.get(key: "test/index.test.js").test(hidden))
+    null
+  }
+
+  """
+  Mocha 12 is ESM and renamed the config loaders a filtered run borrows, so a
+  filtered run is checked against it too: the ESM sample project, its
+  `.mocharc.json` spec, and a failing file that only the whole run reaches.
+  """
+  mocha12Check: Void @check {
+    let ws = esmProject
+      .withNewFile(
+        "package.json",
+        "{\"name\": \"mocha-fixture-esm-12\", \"private\": true, \"type\": \"module\", \"devDependencies\": {\"mocha\": \"^12.0.2\"}}\n",
+      )
+      .withNewFile(
+        "test/broken.test.js",
+        "import assert from \"node:assert\";\n\ndescribe(\"broken\", () => {\n  it(\"fails\", () => {\n    assert.equal(1, 2);\n  });\n});\n",
+      )
+      .asWorkspace
+    let tests = mochajs.projects(ws).get(key: ".").tests(ws)
+    assert(
+      tests.keys == ["test/broken.test.js", "test/index.test.js"],
+      "test files: " + tests.keys.join(", "),
+    )
+    run(tests.get(key: "test/index.test.js").test(ws))
+    run(tests.subset(keys: ["test/index.test.js"]).batch.test(ws))
+    assert(failed(tests.batch.test(ws)), "the whole project run missed the failing file")
+    null
+  }
+
+  """
+  Settings apply to every run: flags reach Mocha whether the project runs
+  whole or file by file.
+  """
+  settingsCheck: Void @check {
+    let ws = cjsProject.withNewFile("test/broken.test.js", failingTest).asWorkspace
+    let tests = mochajs(flags: ["--grep", "passes"]).projects(ws).get(key: ".").tests(ws)
+    run(tests.batch.test(ws))
+    run(tests.get(key: "test/broken.test.js").test(ws))
+    null
+  }
+
+  """
   A failing test file, used to observe which projects a run actually covered.
   """
   let failingTest: String! =
     "const assert = require(\"node:assert\");\n\ndescribe(\"broken\", () => {\n  it(\"fails\", () => {\n    assert.equal(1, 2);\n  });\n});\n"
 
   """
-  Whether `testAll` from `cwd` observed the failure planted in `tree`.
+  Whether testing every project visible from `cwd` observed the failure
+  planted in `tree`, through the project batch and through the test file
+  checks of each project.
   """
-  let testAllFailed(tree: Directory!, cwd: String!): Boolean! {
-    {
-      mochajs.testAll(tree.asWorkspace(cwd: cwd))
+  let testFailed(tree: Directory!, cwd: String!): Boolean! {
+    let ws = tree.asWorkspace(cwd: cwd)
+    let all = mochajs.projects(ws)
+    let batch = {
+      all.batch.test(ws)
       false
     } rescue true
+    let checks = all.keys.any { key =>
+      failed(
+        all.get(key: key).tests(ws).batch.test(ws),
+      )
+    }
+    if (batch != checks) {
+      raise "the project batch and the test file checks disagreed from " + cwd
+    }
+    batch
   }
 
   """
-  `testAll` runs every project below the cwd, and entering one of them leaves
-  its siblings out of reach.
+  Testing from the workspace root runs every project below it, and entering
+  one of them leaves its siblings out of reach.
   """
   descendantScopeCheck: Void @check {
     let broken = siblings.withNewFile("b/test/broken.test.js", failingTest)
 
-    if (testAllFailed(broken, ".") == false) {
-      raise "testAll from the workspace root should have run the project b"
+    if (testFailed(broken, ".") == false) {
+      raise "testing from the workspace root should have run the project b"
     }
-    if (testAllFailed(broken, "a")) {
-      raise "testAll from a should not have run the sibling project b"
+    if (testFailed(broken, "a")) {
+      raise "testing from a should not have run the sibling project b"
     }
-    if (testAllFailed(
+    if (testFailed(broken, "a/test")) {
+      raise "testing from a/test should not have run the sibling project b"
+    }
+    if (testFailed(
       siblings.withNewFile("a/test/broken.test.js", failingTest),
       "a",
     ) == false) {
-      raise "testAll from a should have run a's own tests"
+      raise "testing from a should have run a's own tests"
+    }
+    if (testFailed(
+      siblings.withNewFile("a/test/broken.test.js", failingTest),
+      "a/test",
+    ) == false) {
+      raise "testing from a/test should have run the enclosing project a"
     }
 
     null
   }
 
   """
-  A cwd holding no config sits inside its enclosing project, so `testAll` runs
-  that project too rather than only the ones below the cwd.
+  A cwd holding no config sits inside its enclosing project, so that project is
+  tested too rather than only the ones below the cwd.
   """
   ancestorScopeCheck: Void @check {
-    if (testAllFailed(
+    if (testFailed(
       ancestor.withNewFile("test/broken.test.js", failingTest),
       "work",
     ) == false) {
-      raise "testAll from work should have run the enclosing project"
+      raise "testing from work should have run the enclosing project"
     }
 
     null

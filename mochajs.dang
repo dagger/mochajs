@@ -640,7 +640,8 @@ type MochajsProject {
   Everything the install reads, and nothing else, so editing source files
   does not re-run it: the manifests, lockfiles and package manager config,
   plus the directories that file:, link: and portal: dependencies and pnpm's
-  injected workspace packages point at, which the install copies. When those
+  injected workspace packages point at, which the install copies, and the
+  "bin" files it links. When those
   cannot be worked out, the whole source, so the install is still right.
   """
   let installInputs(ws: Workspace!, root: String!): Directory! {
@@ -698,9 +699,10 @@ type MochajsProject {
 
   """
   Root-relative paths that the install root's file:, link: and portal:
-  dependencies, overrides and resolutions point at, and the directories of
-  workspace packages pnpm injects. Null when a manifest is not valid JSON, or
-  a path cannot be placed inside the install root.
+  dependencies, overrides and resolutions point at, the directories of
+  workspace packages pnpm injects, and the files packages name in "bin", which
+  the install links into node_modules/.bin. Null when a manifest is not valid
+  JSON, or a dependency path cannot be placed inside the install root.
   """
   let localDependencies(ws: Workspace!, root: String!): [String!] {
     {
@@ -717,7 +719,14 @@ type MochajsProject {
         let injected = text.matchAll(`"([^"]+)"\s*:\s*\{\s*"injected"\s*:\s*true`).map { m =>
           "injected:" + m.captures.takeFirst(1).join("")
         }
-        acc + paths + injected + ["package:" + (manifest.name ?? "") + "=" + dir]
+        # "bin" is a path, or an object of command names to paths.
+        let binField = text.matchAll(`"bin"\s*:\s*("[^"]*"|\{[^}]*\})`).map { m =>
+          m.captures.takeFirst(1).join("")
+        }.takeFirst(1).join("")
+        let bins = binField.matchAll(`"([^"]*)"\s*(?:,|\}|$)`).map { m =>
+          "bin:" + tool.within(dir, m.captures.takeFirst(1).join(""))
+        }
+        acc + paths + injected + bins + ["package:" + (manifest.name ?? "") + "=" + dir]
       }
       let packages = facts.filter { f => f.hasPrefix("package:") }.map { f => f.trimPrefix("package:") }
       let injectedDirs = facts
@@ -728,7 +737,12 @@ type MochajsProject {
         }
       let paths = facts.filter { f => f.hasPrefix("path:") }.map { f => f.trimPrefix("path:") }
         + injectedDirs
-      if (paths.contains("") or paths.contains(".")) { null } else { paths.uniq }
+      # A bin outside the install root is not needed to link the others.
+      let bins = facts
+        .filter { f => f.hasPrefix("bin:") }
+        .map { f => f.trimPrefix("bin:") }
+        .filter { f => f != "" and f != "." }
+      if (paths.contains("") or paths.contains(".")) { null } else { (paths + bins).uniq }
     } rescue {
       err: Error => null
     }

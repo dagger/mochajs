@@ -75,8 +75,8 @@ setting.
    files an install reads (every `package.json`, lockfiles, `.npmrc`,
    `.yarnrc*`, `.yarn/releases`, `patches`, …, plus the directories that
    `file:`, `link:` and `portal:` dependencies and pnpm's injected workspace
-   packages point at) are mounted for it, so editing other source does not
-   rerun it. When those directories cannot be worked out (a `package.json`
+   packages point at, and the files packages name in `"bin"`) are mounted for
+   it, so editing other source does not rerun it. When those directories cannot be worked out (a `package.json`
    that is not valid JSON, or a path outside the install root), the whole
    source is mounted instead. Package manager caches, and pnpm's store (passed
    as `--store-dir`), live on cache volumes.

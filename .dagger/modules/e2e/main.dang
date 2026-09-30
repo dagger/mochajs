@@ -219,6 +219,50 @@ type E2E {
   }
 
   """
+  A workspace package's "bin" is linked into node_modules/.bin, so a test can
+  run the CLI: the install sees the bin file, not only the manifests. pnpm 10
+  skips the link when the file is missing; pnpm 12 links it anyway.
+  """
+  workspaceBinCheck: Void @check {
+    let ws = directory
+      .withNewFile(
+        "package.json",
+        "{\"name\": \"root\", \"private\": true, \"packageManager\": \"pnpm@10.18.3\", \"devDependencies\": {\"mocha\": \"^11.7.5\", \"hello-cli\": \"workspace:*\"}}\n",
+      )
+      .withNewFile("pnpm-workspace.yaml", "packages:\n  - packages/*\n")
+      .withNewFile(
+        "packages/hello-cli/package.json",
+        "{\"name\": \"hello-cli\", \"version\": \"1.0.0\", \"bin\": {\"hello-cli\": \"bin/hello.js\"}}\n",
+      )
+      .withNewFile("packages/hello-cli/bin/hello.js", "#!/usr/bin/env node\nconsole.log(\"hello\");\n")
+      .withNewFile(".mocharc.json", "{\"spec\": \"test/*.test.js\"}\n")
+      .withNewFile(
+        "test/cli.test.js",
+        "const assert = require(\"node:assert\");\nconst { execFileSync } = require(\"node:child_process\");\n\nit(\"runs a workspace CLI\", () => {\n  assert.strictEqual(execFileSync(\"node_modules/.bin/hello-cli\").toString().trim(), \"hello\");\n});\n",
+      )
+      .asWorkspace
+    let result = wholeOutcome(mochajs, ws, ".")
+    assert(result == "passed", "workspace bin: " + result)
+    null
+  }
+
+  """
+  Tests may delete globals the exporter could use (fetch, ReadableStream,
+  TextEncoder); the instrumentation must not turn that into a failed run.
+  """
+  mutatedGlobalsCheck: Void @check {
+    let ws = cjsProject
+      .withNewFile(
+        "test/globals.test.js",
+        "const assert = require(\"node:assert\");\n\ndescribe(\"globals\", () => {\n  afterEach(() => {\n    delete globalThis.ReadableStream;\n    delete globalThis.fetch;\n    delete globalThis.Request;\n    delete globalThis.Response;\n    delete globalThis.Headers;\n  });\n  after(() => {\n    delete globalThis.TextEncoder;\n    delete globalThis.TextDecoder;\n  });\n  for (let i = 0; i < 5; i++) {\n    it(\"test \" + i, async () => {\n      await new Promise((resolve) => setTimeout(resolve, 20));\n      assert.ok(true);\n    });\n  }\n});\n",
+      )
+      .asWorkspace
+    let result = wholeOutcome(mochajs, ws, ".")
+    assert(result == "passed", "mutated globals: " + result)
+    null
+  }
+
+  """
   Dependencies install at the workspace root, so a package can use its
   workspace siblings, and the package manager is detected from package.json.
   """

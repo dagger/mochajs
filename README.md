@@ -73,8 +73,13 @@ setting.
    honours the `"packageManager"` version.
 3. **Install.** `<package manager> install` plus `installFlags`. Only the
    files an install reads (every `package.json`, lockfiles, `.npmrc`,
-   `.yarnrc*`, `.yarn/releases`, `patches`, …) are mounted for it, so editing
-   source does not rerun it. Package manager caches live on cache volumes.
+   `.yarnrc*`, `.yarn/releases`, `patches`, …, plus the directories that
+   `file:`, `link:` and `portal:` dependencies and pnpm's injected workspace
+   packages point at) are mounted for it, so editing other source does not
+   rerun it. When those directories cannot be worked out (a `package.json`
+   that is not valid JSON, or a path outside the install root), the whole
+   source is mounted instead. Package manager caches, and pnpm's store (passed
+   as `--store-dir`), live on cache volumes.
    Playwright, Puppeteer and Cypress downloads and git hooks are skipped.
 4. **Build**, when `build` is set: `<package manager> run build`.
 5. **Mocha**: the project's own `node_modules/.bin/mocha`, looked up from the
@@ -165,6 +170,14 @@ settings.environment = ["MONGOMS_DISTRO=ubuntu-22.04"]
 settings.timeout = 3600
 ```
 
+Or from the CLI, where `dagger settings mochajs` lists them:
+
+```console
+$ dagger settings mochajs timeout 3600
+$ dagger settings mochajs flags -- --exit     # "--" before values that start with "-"
+$ dagger settings -u mochajs timeout          # unset: back to the default
+```
+
 `timeout` bounds each Mocha run, so a run that never ends fails instead of
 holding `dagger check` forever. The default, 30 minutes, is well past what one
 project's suite normally takes, and short enough to catch a hang in CI. The
@@ -184,7 +197,9 @@ in the Mocha config.
   `mongodb-memory-server` on arm64.
 - **Calling functions from the CLI.** `dagger call` cannot navigate
   collections yet; use the shell form:
-  `dagger -c 'mochajs | projects | get app | list'`.
+  `dagger -c 'mochajs | projects | get app | list'`. Run the tests with
+  `dagger check`, in CI especially: calling a check function through
+  `dagger call` or `dagger -c` does not fail the command when the check fails.
 
 ## Using it from another module
 

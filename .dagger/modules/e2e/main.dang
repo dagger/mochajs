@@ -193,6 +193,32 @@ type E2E {
   }
 
   """
+  pnpm copies file: dependencies at install time, so their files are install
+  inputs too, not only their package.json.
+  """
+  localDependencyCheck: Void @check {
+    let ws = cjsProject
+      .withNewFile(
+        "package.json",
+        packageJson(
+          "commonjs",
+          "^11.7.5",
+          ", \"packageManager\": \"pnpm@12.8.1\", \"dependencies\": {\"local-dep\": \"file:./local-dep\"}",
+        ),
+      )
+      .withNewFile("local-dep/package.json", "{\"name\": \"local-dep\", \"version\": \"1.0.0\", \"main\": \"index.js\"}\n")
+      .withNewFile("local-dep/index.js", "module.exports = 7;\n")
+      .withNewFile(
+        "test/local.test.js",
+        "const assert = require(\"node:assert\");\n\nit(\"uses a file: dependency\", () => {\n  assert.strictEqual(require(\"local-dep\"), 7);\n});\n",
+      )
+      .asWorkspace
+    let result = wholeOutcome(mochajs, ws, ".")
+    assert(result == "passed", "file: dependency: " + result)
+    null
+  }
+
+  """
   Dependencies install at the workspace root, so a package can use its
   workspace siblings, and the package manager is detected from package.json.
   """
@@ -217,7 +243,7 @@ type E2E {
     let pnpm = cjsProject
       .withNewFile(
         "package.json",
-        packageJson("commonjs", "^11.7.5", ", \"packageManager\": \"pnpm@9.15.0\""),
+        packageJson("commonjs", "^11.7.5", ", \"packageManager\": \"pnpm@12.8.1\""),
       )
       .withNewFile(
         "test/pnpm.test.js",

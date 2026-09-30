@@ -165,7 +165,9 @@ type Mochajs {
       let ctr = if (pm == "pnpm") {
         base
           .withMountedCache("/root/.pnpm-store", cacheVolume("pnpm-store"))
-          .withEnvVariable("npm_config_store_dir", "/root/.pnpm-store")
+          # pnpm 12 ignores npm_config_store_dir, which npm warns about
+          # anyway, so the install also passes --store-dir.
+          .withEnvVariable("pnpm_config_store_dir", "/root/.pnpm-store")
       } else {
         base
       }
@@ -206,6 +208,35 @@ type Mochajs {
       path
     } else {
       path.trimPrefix(dir + "/")
+    }
+  }
+
+  """
+  A relative path from dir, resolved to a workspace-root-relative one; ""
+  when it is absolute or climbs above the root.
+  """
+  let within(dir: String!, rel: String!): String! {
+    let empty: [String!]! = []
+    # No segment can contain "/", so this marks a path that left the root.
+    let invalid = ["/"]
+    let start = if (dir == ".") { empty } else { dir.split("/") }
+    let resolved = rel.split("/").reduce(start) { acc, segment =>
+      if (acc == invalid) {
+        acc
+      } else if (segment == "" or segment == ".") {
+        acc
+      } else if (segment == "..") {
+        if (acc.length == 0) { invalid } else { acc.dropLast(1) }
+      } else {
+        acc + [segment]
+      }
+    }
+    if (rel.hasPrefix("/") or rel == "" or resolved == invalid) {
+      ""
+    } else if (resolved.length == 0) {
+      "."
+    } else {
+      resolved.join("/")
     }
   }
 
@@ -605,46 +636,117 @@ type MochajsProject {
 
   """
   Everything the install reads, and nothing else, so editing source files
-  does not re-run it.
+  does not re-run it: the manifests, lockfiles and package manager config,
+  plus the directories that file:, link: and portal: dependencies and pnpm's
+  injected workspace packages point at, which the install copies. When those
+  cannot be worked out, the whole source, so the install is still right.
   """
   let installInputs(ws: Workspace!, root: String!): Directory! {
-    ws.directory(
-      "/" + root,
-      include: [
-        "**/package.json",
-        "pnpm-lock.yaml",
-        "pnpm-workspace.yaml",
-        ".pnpmfile.cjs",
-        "yarn.lock",
-        ".yarnrc",
-        ".yarnrc.yml",
-        ".yarn/releases/**",
-        ".yarn/plugins/**",
-        ".yarn/patches/**",
-        "package-lock.json",
-        "npm-shrinkwrap.json",
-        "bun.lock",
-        "bun.lockb",
-        "bunfig.toml",
-        "**/.npmrc",
-        "patches/**",
-      ],
-      exclude: ["**/node_modules"],
-    )
+    let local = localDependencies(ws, root)
+    if (local == null) {
+      ws.directory("/" + root, exclude: ["**/node_modules", ".git"], gitignore: true)
+    } else {
+      let empty: [String!]! = []
+      ws.directory(
+        "/" + root,
+        include: [
+          "**/package.json",
+          "pnpm-lock.yaml",
+          "pnpm-workspace.yaml",
+          ".pnpmfile.cjs",
+          "yarn.lock",
+          ".yarnrc",
+          ".yarnrc.yml",
+          ".yarn/releases/**",
+          ".yarn/plugins/**",
+          ".yarn/patches/**",
+          "package-lock.json",
+          "npm-shrinkwrap.json",
+          "bun.lock",
+          "bun.lockb",
+          "bunfig.toml",
+          "**/.npmrc",
+          "patches/**",
+        ]
+          + (local ?? empty).reduce(empty) { acc, dir => acc + [dir, dir + "/**"] },
+        exclude: ["**/node_modules"],
+      )
+    }
   }
 
   """
-  The install command. pnpm and Yarn freeze the lockfile under CI, which
-  fails when there is none to freeze, so that case opts out.
+  The package.json files below the install root, relative to it, found with
+  one search that skips node_modules.
+  """
+  let manifests(ws: Workspace!, root: String!): [String!]! {
+    ws
+      .search(
+        paths: ["/" + root],
+        globs: ["package.json", "!node_modules", "!.git"],
+        pattern: "",
+        filesOnly: true,
+      ).{{filePath}}
+      .map { found =>
+        tool.relativeTo(
+          root,
+          tool.normalize(found.filePath.trimPrefix("./")),
+        )
+      }
+  }
+
+  """
+  Root-relative paths that the install root's file:, link: and portal:
+  dependencies, overrides and resolutions point at, and the directories of
+  workspace packages pnpm injects. Null when a manifest is not valid JSON, or
+  a path cannot be placed inside the install root.
+  """
+  let localDependencies(ws: Workspace!, root: String!): [String!] {
+    {
+      let empty: [String!]! = []
+      # One read per manifest, tagged: "path:" a local dependency, "package:"
+      # a package's name and directory, "injected:" a package pnpm injects.
+      let facts = manifests(ws, root).reduce(empty) { acc, file =>
+        let dir = tool.normalize(file.split("/").dropLast(1).join("/"))
+        let text = ws.file("/" + tool.join(root, file)).contents
+        let manifest = JSON.decode(text) :: {{name: String}}!
+        let paths = text.matchAll(`"(?:file|link|portal):([^"]*)"`).map { m =>
+          "path:" + tool.within(dir, m.captures.takeFirst(1).join(""))
+        }
+        let injected = text.matchAll(`"([^"]+)"\s*:\s*\{\s*"injected"\s*:\s*true`).map { m =>
+          "injected:" + m.captures.takeFirst(1).join("")
+        }
+        acc + paths + injected + ["package:" + (manifest.name ?? "") + "=" + dir]
+      }
+      let packages = facts.filter { f => f.hasPrefix("package:") }.map { f => f.trimPrefix("package:") }
+      let injectedDirs = facts
+        .filter { f => f.hasPrefix("injected:") }
+        .map { f => f.trimPrefix("injected:") + "=" }
+        .reduce(empty) { acc, prefix =>
+          acc + packages.filter { p => p.hasPrefix(prefix) }.map { p => p.trimPrefix(prefix) }
+        }
+      let paths = facts.filter { f => f.hasPrefix("path:") }.map { f => f.trimPrefix("path:") }
+        + injectedDirs
+      if (paths.contains("") or paths.contains(".")) { null } else { paths.uniq }
+    } rescue {
+      err: Error => null
+    }
+  }
+
+  """
+  The install command. pnpm keeps its store on the cache volume, and pnpm
+  and Yarn freeze the lockfile under CI, which fails when there is none to
+  freeze, so that case opts out.
   """
   let installCommand(ws: Workspace!, root: String!): [String!]! {
     let pm = packageManager(ws, root)
+    let empty: [String!]! = []
+    let store = if (pm == "pnpm") { ["--store-dir", "/root/.pnpm-store"] } else { empty }
     let unfrozen = if (pm == "pnpm" and has(ws, root, "pnpm-lock.yaml") == false) {
       ["--no-frozen-lockfile"]
     } else {
-      []
+      empty
     }
-    [pm, "install"] + unfrozen + tool.installFlags
+    [pm, "install"] + store + unfrozen + tool.installFlags
   }
 
   """

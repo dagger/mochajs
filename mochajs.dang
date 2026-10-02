@@ -510,7 +510,7 @@ type MochajsProject {
   timeout.
   """
   let mocha(ws: Workspace!, args: [String!]!): [String!]! {
-    let command = if (installRoot(ws) == null) { ["npx", "--yes", "mocha"] } else { ["mocha"] }
+    let command = if (installRoot(ws) == null) { ["npx", "--yes", "mocha"] } else { [wrapperPath] }
     ["sh", "/dagger-mocha/timeout.sh"] + command + args
   }
 
@@ -531,6 +531,13 @@ type MochajsProject {
       + "exec \"$@\"\n"
 
   # 124 from coreutils' timeout, 143 (SIGTERM) from busybox's.
+
+  """
+  Where the wrapper is installed: off PATH, and called by this path, so
+  nothing that looks mocha up on PATH (npx, yarn run) can find the wrapper and
+  loop back into it.
+  """
+  let wrapperPath: String! = "/opt/dagger-mocha/mocha"
 
   """
   A mocha command that runs the nearest node_modules/.bin/mocha between the
@@ -822,7 +829,7 @@ type MochajsProject {
       installed(ws, root ?? ".")
         .withDirectory("/src", source)
         # 493 is 0755.
-        .withNewFile("/usr/local/bin/mocha", wrapper(root ?? "."), permissions: 493)
+        .withNewFile(wrapperPath, wrapper(root ?? "."), permissions: 493)
     }
     let dir = tool.relativeTo(mount, path)
     let configured = tool.environment.reduce(ctr) { acc, pair =>

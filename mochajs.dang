@@ -185,6 +185,13 @@ type Mochajs {
   }
 
   """
+  A literal string as a regular expression, for Mocha's --grep.
+  """
+  let quoteRegex(text: String!): String! {
+    text.rewriteMatches(`[\\^$.|?*+()\[\]{}]`) { m => "\\" + m.string }
+  }
+
+  """
   Workspace-root path of name inside dir.
   """
   let join(dir: String!, name: String!): String! {
@@ -341,7 +348,7 @@ type MochajsProjects @collection {
   test(ws: Workspace!): Void {
     # A selection over a list evaluates its elements concurrently, so all
     # project test runs happen in parallel.
-    let failures = paths.map { p => project(p) }.{{path, failure: testFailure(ws, [])}}
+    let failures = paths.map { p => project(p) }.{{path, failure: testFailure(ws, [], [])}}
       .filter { result => result.failure != null }
     if (failures.length > 0) {
       raise "Mocha failed in " + toString(failures.length) + " project(s):\n"
@@ -368,15 +375,15 @@ type MochajsProject {
   """
   Test files in this project, keyed by project-relative path.
   """
-  tests(ws: Workspace!): MochajsTestFiles! {
-    MochajsTestFiles(files: testFiles(ws), project: self)
+  testFiles(ws: Workspace!): MochajsTestFiles! {
+    MochajsTestFiles(files: testFilePaths(ws), project: self)
   }
 
   """
   Run this project's tests.
   """
   test(ws: Workspace!): Void {
-    let failure = testFailure(ws, [])
+    let failure = testFailure(ws, [], [])
     if (failure != null) {
       raise "Mocha failed in " + path + ": " + (failure ?? "")
     }
@@ -387,11 +394,7 @@ type MochajsProject {
   List the tests of this project.
   """
   list(ws: Workspace!): String! {
-    let install = installFailure(ws)
-    if (install != null) {
-      raise "Mocha failed in " + path + ": " + (install ?? "")
-    }
-    let ran = runner(ws).withExec(mocha(ws, ["--dry-run"]), expect: ReturnType.ANY)
+    let ran = dryRun(ws, [])
     let failure = toolFailure(ran, "mocha --dry-run")
     if (failure != null) {
       raise "Mocha failed in " + path + ": " + (failure ?? "")
@@ -423,13 +426,14 @@ type MochajsProject {
 
   """
   Why this project's tests failed, naming the step, or null when they pass:
-  the whole project when files is empty, else only the named files. It never
+  the whole project when files is empty, else only the named files, and only
+  the tests with the named full titles when titles is not empty. It never
   raises, so a batch reports every project.
   """
-  let testFailure(ws: Workspace!, files: [String!]!): String {
+  let testFailure(ws: Workspace!, files: [String!]!, titles: [String!]!): String {
     {
       let install = installFailure(ws)
-      if (install != null) { install } else { toolFailure(testExec(ws, files), "mocha") }
+      if (install != null) { install } else { toolFailure(testExec(ws, files, titles), "mocha") }
     } rescue {
       err: Error => err.message
     }
@@ -439,7 +443,16 @@ type MochajsProject {
   Run the given test files, naming this project when they fail.
   """
   let runFiles(ws: Workspace!, files: [String!]!): Void {
-    let failure = testFailure(ws, files)
+    let empty: [String!]! = []
+    runTests(ws, files, empty)
+  }
+
+  """
+  Run the tests with the given full titles in the given test files, naming
+  this project when they fail.
+  """
+  let runTests(ws: Workspace!, files: [String!]!, titles: [String!]!): Void {
+    let failure = testFailure(ws, files, titles)
     if (failure != null) {
       raise "Mocha failed in " + path + ": " + (failure ?? "")
     }
@@ -448,11 +461,19 @@ type MochajsProject {
 
   """
   Container that has run this project's tests: the whole project, as its own
-  Mocha config selects them, when files is empty, else only the named files.
+  Mocha config selects them, when files is empty, else only the named files,
+  narrowed to the named full titles when titles is not empty.
   """
-  let testExec(ws: Workspace!, files: [String!]!): Container! {
+  let testExec(ws: Workspace!, files: [String!]!, titles: [String!]!): Container! {
+    let empty: [String!]! = []
+    # Mocha matches --grep against a test's full title. Anchoring it keeps a
+    # title that another one starts with from pulling that one in, and it
+    # comes after the settings' flags so a --grep there does not win.
+    let selection = if (titles.length == 0) { empty } else {
+      ["--grep", "^(" + titles.map { title => tool.quoteRegex(title) }.join("|") + ")$"]
+    }
     let args = if (files.length == 0) { tool.flags } else {
-      ["--config", filesConfigPath, "--no-package"] + tool.flags + files
+      ["--config", filesConfigPath, "--no-package"] + tool.flags + selection + files
     }
     runner(ws)
       .withNewFile(filesConfigPath, filesConfig)
@@ -836,6 +857,19 @@ type MochajsProject {
   them; otherwise npx fetches Mocha on demand.
   """
   let runner(ws: Workspace!): Container! {
+    runnerBase(ws).withEnvVariable(
+      "NODE_OPTIONS",
+      "$NODE_OPTIONS --require /dagger-mocha/lib/dist/cjs/register.cjs",
+      expand: true,
+    )
+  }
+
+  """
+  The runner without the instrumentation preloaded, for the runs that only
+  list tests: a dry run emits Mocha's events too, so an instrumented one
+  would record spans for tests that never ran.
+  """
+  let runnerBase(ws: Workspace!): Container! {
     let root = installRoot(ws)
     let mount = root ?? path
     let source = ws.directory(
@@ -876,11 +910,65 @@ type MochajsProject {
       .withDirectory("/dagger-mocha/lib", tool.library)
       .withNewFile("/dagger-mocha/timeout.sh", timeoutScript)
       .withEnvVariable("DAGGER_MOCHA_TIMEOUT", toString(tool.timeout))
-      .withEnvVariable(
-        "NODE_OPTIONS",
-        "$NODE_OPTIONS --require /dagger-mocha/lib/dist/cjs/register.cjs",
-        expand: true,
-      )
+  }
+
+  """
+  Container that has listed, without running them, the tests the project's
+  own Mocha config selects. The run may have failed: read exitCode.
+  """
+  let dryRun(ws: Workspace!, args: [String!]!): Container! {
+    let install = installFailure(ws)
+    if (install != null) {
+      raise "Mocha failed in " + path + ": " + (install ?? "")
+    }
+    runnerBase(ws).withExec(
+      mocha(ws, ["--dry-run"] + tool.flags + args),
+      expect: ReturnType.ANY,
+    )
+  }
+
+  """
+  Where the dry run writes its report. The json reporter writes to a file
+  rather than to stdout, which anything the test files print while loading
+  would otherwise share.
+  """
+  let testListPath: String! = "/dagger-mocha/tests.json"
+
+  """
+  Every test Mocha would run, with the absolute path of the file it is in.
+  One dry run covers the whole project, so listing the tests of each file
+  costs one container per project rather than one per file. Titles come from
+  Mocha itself, so the ones it computes as it loads the files are listed as
+  they will appear, and a test the config or the settings' flags exclude is
+  not listed at all.
+  """
+  let testIndex(ws: Workspace!): [{{file: String!, fullTitle: String!}}!]! {
+    let ran = dryRun(
+      ws,
+      ["--reporter", "json", "--reporter-option", "output=" + testListPath],
+    )
+    let failure = toolFailure(ran, "mocha --dry-run")
+    if (failure != null) {
+      raise "Mocha could not list the tests of " + path + ": " + (failure ?? "")
+    }
+    let listed = JSON.decode(ran.file(testListPath).contents) :: {{
+      tests: [{{file: String!, fullTitle: String!}}!]!,
+    }}!
+    listed.tests
+  }
+
+  """
+  Full titles of the tests in a project-relative test file, in the order
+  Mocha reports them. The runner mirrors the workspace, so the paths Mocha
+  reports resolve under the project root.
+  """
+  let testTitles(ws: Workspace!, file: String!): [String!]! {
+    let prefix = tool.containerPath(path) + "/"
+    testIndex(ws)
+      .filter { entry => entry.file.trimPrefix(prefix) == file }
+      .map { entry => entry.fullTitle }
+      # Two tests can share a full title; the one key then runs both.
+      .uniq
   }
 
   # Test files are found with one ripgrep search over the project, rather than
@@ -890,7 +978,7 @@ type MochajsProject {
   # `ignore` option are not read, and a project whose config cannot be read
   # statically is assumed to use Mocha's defaults. Empty files, which hold no
   # tests, are not listed.
-  let testFiles(ws: Workspace!): [String!]! {
+  let testFilePaths(ws: Workspace!): [String!]! {
     let text = configText(ws)
     let specs = if (text == null) { null } else { specOption(text ?? "") }
     let extensions = if (text == null) { null } else { extensionOption(text ?? "") }
@@ -1070,9 +1158,11 @@ type MochajsTestFiles @collection {
   }
 
   """
-  Run the selected test files in this project.
+  Run the selected test files in this project. A plain function, not a check:
+  the tests of each file are a collection of their own, and its check runs
+  them, so dagger check does not run the same tests twice.
   """
-  test(ws: Workspace!): Void @check {
+  test(ws: Workspace!): Void {
     # With nothing selected out, run the project as Mocha's own config selects
     # it rather than naming every file. Without a delta, naming the files is
     # the safe choice.
@@ -1102,9 +1192,88 @@ type MochajsTestFile {
   let project: MochajsProject!
 
   """
-  Run the Mocha tests in a test file.
+  The tests in this file, keyed by the full title Mocha reports.
+  """
+  tests(ws: Workspace!): MochajsTests! {
+    MochajsTests(titles: project.testTitles(ws, path), file: self)
+  }
+
+  """
+  Run the Mocha tests in a test file. A plain function, not a check: the
+  tests collection below it holds the check.
+  """
+  test(ws: Workspace!): Void {
+    project.runFiles(ws, [path])
+  }
+
+  """
+  Run the tests with these full titles.
+  """
+  let runTests(ws: Workspace!, titles: [String!]!): Void {
+    project.runTests(ws, [path], titles)
+  }
+}
+
+"""
+Tests in a Mocha test file, keyed by the full title Mocha reports: the titles
+of the suites around a test and its own, joined by spaces.
+"""
+type MochajsTests @collection {
+  """
+  Full titles, in the order Mocha reports them.
+  """
+  titles: [String!]! @keys
+
+  """
+  Tests selected in or out since the collection was discovered.
+  """
+  delta: CollectionDelta
+
+  let file: MochajsTestFile!
+
+  """
+  The test with this full title.
+  """
+  named(title: String!): MochajsTest! @get {
+    MochajsTest(title: title, file: file)
+  }
+
+  """
+  Run the selected tests of this file.
   """
   test(ws: Workspace!): Void @check {
-    project.runFiles(ws, [path])
+    # With nothing selected out, run the file and let Mocha select the tests
+    # in it rather than naming every one. Without a delta, naming them is the
+    # safe choice.
+    let whole = if (delta == null) {
+      false
+    } else {
+      delta.addedKeys.length == 0 and delta.removedKeys.length == 0
+    }
+    if (whole) {
+      file.test(ws)
+    } else if (titles.length > 0) {
+      file.runTests(ws, titles)
+    }
+    null
+  }
+}
+
+"""
+A Mocha test.
+"""
+type MochajsTest {
+  """
+  Full title: the titles of the suites around this test and its own.
+  """
+  title: String!
+
+  let file: MochajsTestFile!
+
+  """
+  Run this test.
+  """
+  test(ws: Workspace!): Void @check {
+    file.runTests(ws, [title])
   }
 }

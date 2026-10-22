@@ -1,7 +1,7 @@
 # Mocha Dagger Toolchain
 
-Runs [Mocha](https://mochajs.org) tests as Dagger checks, one check per test
-file, across every Mocha project in a workspace. Suites and tests show up as
+Runs [Mocha](https://mochajs.org) tests as Dagger checks, down to a single
+test, across every Mocha project in a workspace. Suites and tests show up as
 spans in the Dagger trace.
 
 ## Requirements
@@ -19,40 +19,49 @@ $ dagger install github.com/dagger/mochajs
 ## Checks
 
 The module has one check, `test`, and it runs per test file. Its address is
-`mochajs/projects/tests/test`, and it has two dimensions:
+`mochajs/projects/test-files/tests/test`, and it has three dimensions:
 
 | Flag | Selects |
 | --- | --- |
 | `--mochajs-project=PATH` | a project, by its root relative to the workspace root (repeatable) |
 | `--mochajs-projects` | every project |
 | `--mochajs-test-file=PATH` | a test file, by its path relative to the project root (repeatable) |
-| `--mochajs-tests` | every test file |
+| `--mochajs-test-files` | every test file |
+| `--mochajs-test=TITLE` | a test, by the full title Mocha reports (repeatable) |
+| `--mochajs-tests` | every test |
 | `--mochajs`, `--by-mochajs` | this module's checks |
 | `--check test` | checks named `test`, in every installed module |
 
 ```console
-$ dagger check -l --all --mochajs                  # one line per project and test file
-$ dagger check --mochajs                           # every project, each run whole
+$ dagger check -l --all --mochajs                  # one line per project, file and test
+$ dagger check --mochajs                           # every test file, each run whole
 $ dagger check --mochajs --mochajs-project=app
 $ dagger check --mochajs --mochajs-project=app --mochajs-test-file=test/add.test.js
-$ dagger check mochajs/projects/tests/test --mochajs-project=app   # the same, by path
+$ dagger check --mochajs --mochajs-test="add adds two numbers"
+$ dagger check mochajs/projects/test-files/tests/test --mochajs-project=app  # by path
 $ dagger list mochajs-projects -a
 $ dagger list mochajs-test-files -a --mochajs-project=app
+$ dagger list mochajs-tests -a --mochajs-test-file=test/add.test.js
 ```
 
 `--check test` alone also selects every other installed module's check named
 `test`; `--mochajs` narrows it to this one. When another installed module also
-has a `MochajsProject` or `MochajsTestFile` type, the flags take a qualified
-name; `dagger check --help` lists the flags in effect.
+has a `MochajsProject`, `MochajsTestFile` or `MochajsTest` type, the flags take
+a qualified name; `dagger check --help` lists the flags in effect.
 
-`test` runs once per selected project. With every test file of a project
-selected, it runs the project's own `mocha` in the project root, and the
-project's Mocha config selects the tests, as `npx mocha` would. With some files
-filtered out, it runs only the selected files: the project's config still
-applies, minus its `spec`, which Mocha would otherwise add to the files named
-on the command line. To load that config, a filtered run uses Mocha's own
-loaders from `mocha/lib/cli/options.cjs` (Mocha 12), falling back to
-`mocha/lib/cli/options` (Mocha 9–11).
+`test` runs once per selected test file. With every test of a file selected, it
+runs that one file and the project's Mocha config selects the tests in it. With
+some tests filtered out, Mocha is given `--grep`, anchored to the full titles
+selected, so a title another test's title starts with does not pull that test
+in.
+
+Either way the run names the file on the command line, so the project's config
+applies minus its `spec`, which Mocha would otherwise add to the files named
+there. To load that config, such a run uses Mocha's own loaders from
+`mocha/lib/cli/options.cjs` (Mocha 12), falling back to
+`mocha/lib/cli/options` (Mocha 9–11). The whole project in one run, as
+`npx mocha` would do it, is the `test` function of a project rather than a
+check — see [Using it from another module](#using-it-from-another-module).
 
 The `test` script in `package.json` is not used: flags it passes to Mocha
 (`--exit`, `--require …`) belong in the Mocha config or in the `flags`
@@ -140,6 +149,23 @@ one. Keys are sorted. The limits of reading the config without running it:
 - A project whose spec matches no file lists no test files, so `dagger check`
   does not run it. Call the project's `test` function to run it.
 
+The tests in those files are listed by Mocha itself: one
+`mocha --dry-run --reporter json` per project, which loads the test files
+without running a test or a hook, and reports every test it would run with
+its full title and its file. Titles are therefore the real ones, including
+those a file computes as it loads, and a test the config or the `flags`
+setting excludes is not listed. Keys keep Mocha's order. The cost:
+
+- Listing tests installs the project's dependencies and starts a container,
+  unlike listing files. One dry run covers every file of a project.
+- A project whose test files cannot be loaded, or whose install fails, has no
+  tests to list, so `dagger check` reports that instead of running: Dagger
+  needs the keys before it can run anything under them.
+- A test file is keyed by title, so two tests in it with the same full title
+  share one key, and running it runs both.
+- The instrumentation is not loaded for a dry run, so listing records no
+  spans.
+
 ## Settings
 
 Set these in your `dagger.toml`:
@@ -214,12 +240,15 @@ in the Mocha config.
 | `projects(ws).get(key: p).test(ws)` | run one project, whole; a plain function |
 | `projects(ws).get(key: p).list(ws)` | the tests `mocha --dry-run` reports |
 | `projects(ws).get(key: p).source(ws)` | the project's source directory |
-| `projects(ws).get(key: p).tests(ws)` | the project's test files, as a collection |
-| `tests.batch.test(ws)` | run the selected test files; a check |
-| `tests.get(key: f).test(ws)` | run one test file; a check |
+| `projects(ws).get(key: p).testFiles(ws)` | the project's test files, as a collection |
+| `files.batch.test(ws)` | run the selected test files; a plain function |
+| `files.get(key: f).test(ws)` | run one test file; a plain function |
+| `files.get(key: f).tests(ws)` | the file's tests, as a collection |
+| `tests.batch.test(ws)` | run the selected tests of that file; a check |
+| `tests.get(key: t).test(ws)` | run one test; a check |
 
-`test` on a project and the `projects` batch `test` are plain functions, not
-checks, so `dagger check` does not run the same tests twice. A check called
+Only the tests of a file are checks; everything above them is a plain
+function, so `dagger check` does not run the same tests twice. A check called
 through a dependency returns a `Check` that has not run yet. Run it and raise
 its failure:
 
@@ -231,9 +260,13 @@ let run(check: Check!): Void {
   null
 }
 
-let tests = mochajs.projects(ws).get(key: "app").tests(ws)
-run(tests.batch.test(ws))                                        # whole project
-run(tests.subset(keys: ["test/add.test.js"]).batch.test(ws))     # only this file
+let files = mochajs.projects(ws).get(key: "app").testFiles(ws)
+files.batch.test(ws)                                       # whole project; raises
+files.subset(keys: ["test/add.test.js"]).batch.test(ws)    # only this file; raises
+
+let tests = files.get(key: "test/add.test.js").tests(ws)
+run(tests.batch.test(ws))                                  # the whole file
+run(tests.subset(keys: ["add adds two numbers"]).batch.test(ws))   # only this test
 ```
 
 ## How the tracing works

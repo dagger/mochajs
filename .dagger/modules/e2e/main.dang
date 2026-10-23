@@ -764,6 +764,58 @@ type E2E {
   }
 
   """
+  A project whose tests Mocha cannot list still has something to run: each of
+  its files keeps the unlisted key, running it reports why, and the projects
+  that are fine are untouched. Dagger needs every key before it runs
+  anything, so a project that cannot list its tests must not raise.
+  """
+  unlistableTestsCheck: Void @check {
+    let ws = directory
+      .withDirectory("good", cjsProject)
+      .withDirectory("bad", cjsProject)
+      # A file that throws while Mocha loads it, which fails the dry run of
+      # the whole project, so no file of it can list its tests.
+      .withNewFile(
+        "bad/test/broken.test.js",
+        "describe(\"broken\", () => { it(\"syntax error\"  => {}); });\n",
+      )
+      .asWorkspace
+    let badFiles = mochajs.projects(ws).get(key: "bad").testFiles(ws)
+
+    # The file that throws reports it, through the key that stands for the
+    # whole file.
+    let brokenTests = badFiles.get(key: "test/broken.test.js").tests(ws)
+    assert(brokenTests.keys == ["*"], "unlisted tests: " + brokenTests.keys.join(", "))
+    let why = outcome(brokenTests.batch.test(ws))
+    assert(why.contains("Mocha failed in bad"), "the unlisted file did not say why: " + why)
+    assert(
+      failed(brokenTests.get(key: "*").test(ws)),
+      "the unlisted key passed instead of running the file",
+    )
+
+    # Its siblings lose their per-test keys, since one dry run covers the
+    # project, but still run.
+    let siblingTests = badFiles.get(key: "test/index.test.js").tests(ws)
+    assert(siblingTests.keys == ["*"], "sibling tests: " + siblingTests.keys.join(", "))
+    run(siblingTests.batch.test(ws))
+
+    # The healthy project lists and runs as usual.
+    let goodTests = mochajs
+      .projects(ws)
+      .get(key: "good")
+      .testFiles(ws)
+      .get(key: "test/index.test.js")
+      .tests(ws)
+    assertPaths(
+      goodTests.keys,
+      ["cjs fixture passes", "cjs fixture nested suite also passes"],
+      "tests of the healthy project",
+    )
+    run(goodTests.batch.test(ws))
+    null
+  }
+
+  """
   A test file whose titles exercise the selector: one title that another
   starts with, one computed as the file loads, one holding a regular
   expression metacharacter, and one failing test.

@@ -6,9 +6,9 @@ spans in the Dagger trace.
 
 ## Requirements
 
-Dagger `v1.0.0-beta.15` or later: the module uses Dagger collections, which
-older engines cannot load. Projects need Mocha 9 to 12 in their
-`devDependencies` (Mocha 11 and 12 are tested).
+Dagger `v1.0.0-beta.16` or later: the module uses Dagger collections and runs
+Mocha in a nested session, which older engines cannot load. Projects need
+Mocha 9 to 12 in their `devDependencies` (Mocha 9 to 12 are tested).
 
 ## Installation
 
@@ -158,9 +158,13 @@ setting excludes is not listed. Keys keep Mocha's order. The cost:
 
 - Listing tests installs the project's dependencies and starts a container,
   unlike listing files. One dry run covers every file of a project.
-- A project whose test files cannot be loaded, or whose install fails, has no
-  tests to list, so `dagger check` reports that instead of running: Dagger
-  needs the keys before it can run anything under them.
+- One dry run covers a project, so a single file that throws while Mocha
+  loads it, or an install that fails, leaves every file of that project
+  without per-test keys. Each of them keeps a single key, `*`, standing for
+  the whole file: the files that do load still run their tests, and the one
+  that does not fails with the reason. Dagger needs every key before it runs
+  anything, so without that key one broken project would leave the whole
+  workspace with nothing to run.
 - A test file is keyed by title, so two tests in it with the same full title
   share one key, and running it runs both.
 - The instrumentation is not loaded for a dry run, so listing records no

@@ -961,15 +961,29 @@ type MochajsProject {
   Full titles of the tests in a project-relative test file, in the order
   Mocha reports them. The runner mirrors the workspace, so the paths Mocha
   reports resolve under the project root.
+
+  A file whose tests Mocha cannot list keeps the unlisted key instead: Dagger
+  needs every key before it runs anything, so raising here would leave the
+  whole workspace, including the projects that are fine, with nothing to run.
   """
   let testTitles(ws: Workspace!, file: String!): [String!]! {
     let prefix = tool.containerPath(path) + "/"
-    testIndex(ws)
-      .filter { entry => entry.file.trimPrefix(prefix) == file }
-      .map { entry => entry.fullTitle }
-      # Two tests can share a full title; the one key then runs both.
-      .uniq
+    {
+      testIndex(ws)
+        .filter { entry => entry.file.trimPrefix(prefix) == file }
+        .map { entry => entry.fullTitle }
+        # Two tests can share a full title; the one key then runs both.
+        .uniq
+    } rescue {
+      err: Error => [unlistedKey]
+    }
   }
+
+  """
+  The only key of a test file whose tests Mocha could not list: it stands for
+  the whole file, and running it fails with the reason the listing did.
+  """
+  let unlistedKey: String! = "*"
 
   # Test files are found with one ripgrep search over the project, rather than
   # by asking Mocha, so listing them runs no container and never walks
@@ -1210,7 +1224,14 @@ type MochajsTestFile {
   Run the tests with these full titles.
   """
   let runTests(ws: Workspace!, titles: [String!]!): Void {
-    project.runTests(ws, [path], titles)
+    # The unlisted key stands for the whole file, which is what reports why
+    # its tests could not be listed.
+    if (titles == [project.unlistedKey]) {
+      project.runFiles(ws, [path])
+    } else {
+      project.runTests(ws, [path], titles)
+    }
+    null
   }
 }
 

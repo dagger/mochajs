@@ -1,235 +1,138 @@
-# Mocha Dagger Toolchain
+# Mocha
 
-Runs [Mocha](https://mochajs.org) tests as Dagger checks, down to a single
-test, across every Mocha project in a workspace. Suites and tests show up as
-spans in the Dagger trace.
+The Mocha module runs Mocha tests for JavaScript and TypeScript projects as a
+Dagger check, locally, in CI, and in Dagger Cloud. Each Mocha config roots a
+project, each project's test files are a collection, and so are the tests in
+each file, so a check can run one test, one test file, one project, or
+everything.
 
-## Requirements
+## Add it to your workspace
 
-Dagger `v1.0.0-beta.16` or later: the module uses Dagger collections and runs
-Mocha in a nested session, which older engines cannot load. Projects need
-Mocha 9 to 12 in their `devDependencies` (Mocha 9 to 12 are tested).
-
-## Installation
-
-```console
-$ dagger install github.com/dagger/mochajs
+```bash
+dagger module install dagger.io/js/mocha
 ```
 
-## Checks
+It needs Dagger `v1.0.0-beta.16` or later, and Mocha 9 to 12 in the project's
+`devDependencies`.
 
-The module has one check, `test`, and it runs per test file. Its address is
-`mochajs/projects/test-files/tests/test`, and it has three dimensions:
+## Run the tests
 
-| Flag | Selects |
-| --- | --- |
-| `--mochajs-project=PATH` | a project, by its root relative to the workspace root (repeatable) |
-| `--mochajs-projects` | every project |
-| `--mochajs-test-file=PATH` | a test file, by its path relative to the project root (repeatable) |
-| `--mochajs-test-files` | every test file |
-| `--mochajs-test=TITLE` | a test, by the full title Mocha reports (repeatable) |
-| `--mochajs-tests` | every test |
-| `--mochajs`, `--by-mochajs` | this module's checks |
-| `--check test` | checks named `test`, in every installed module |
-
-```console
-$ dagger check -l --all --mochajs                  # one line per project, file and test
-$ dagger check --mochajs                           # every test file, each run whole
-$ dagger check --mochajs --mochajs-project=app
-$ dagger check --mochajs --mochajs-project=app --mochajs-test-file=test/add.test.js
-$ dagger check --mochajs --mochajs-test="add adds two numbers"
-$ dagger check mochajs/projects/test-files/tests/test --mochajs-project=app  # by path
-$ dagger list mochajs-projects -a
-$ dagger list mochajs-test-files -a --mochajs-project=app
-$ dagger list mochajs-tests -a --mochajs-test-file=test/add.test.js
+```bash
+dagger check --mochajs                                                      # every test of every project
+dagger check --mochajs-project=app                                          # one project
+dagger check --mochajs-project=app --mochajs-test-file=test/add.test.js     # one test file
+dagger check --mochajs-test='add adds two numbers'                          # one test
 ```
 
-`--check test` alone also selects every other installed module's check named
-`test`; `--mochajs` narrows it to this one. When another installed module also
-has a `MochajsProject`, `MochajsTestFile` or `MochajsTest` type, the flags take
-a qualified name; `dagger check --help` lists the flags in effect.
+The check is `mochajs/projects/test-files/tests/test`. It installs
+dependencies and runs the project's own `mocha` once per test file, over the
+selected tests. With every test of a file selected it runs that file and the
+project's config selects the tests in it; with some selected it passes
+`--grep`, anchored to the full titles selected, so a title another test's
+title starts with does not pull that test in. Either way the file is named on
+the command line, so the project's config applies minus its `spec`, which
+Mocha would otherwise add to the files named there.
 
-`test` runs once per selected test file. With every test of a file selected, it
-runs that one file and the project's Mocha config selects the tests in it. With
-some tests filtered out, Mocha is given `--grep`, anchored to the full titles
-selected, so a title another test's title starts with does not pull that test
-in.
+The module registers an OpenTelemetry hook, so suites and individual tests
+appear as spans in the Dagger TUI and Dagger Cloud without changing the
+project's Mocha config or its dependencies.
 
-Either way the run names the file on the command line, so the project's config
-applies minus its `spec`, which Mocha would otherwise add to the files named
-there. To load that config, such a run uses Mocha's own loaders from
-`mocha/lib/cli/options.cjs` (Mocha 12), falling back to
-`mocha/lib/cli/options` (Mocha 9–11). The whole project in one run, as
-`npx mocha` would do it, is the `test` function of a project rather than a
-check — see [Using it from another module](#using-it-from-another-module).
+## Collections
 
-The `test` script in `package.json` is not used: flags it passes to Mocha
-(`--exit`, `--require …`) belong in the Mocha config or in the `flags`
-setting.
+| Flag | Collection | Key |
+|------|-----------|-----|
+| `--mochajs-project` | `projects` | Directory holding the Mocha config, relative to the workspace root. The root is `.` |
+| `--mochajs-test-file` | `testFiles`, on a project | Test file path, relative to the project |
+| `--mochajs-test` | `tests`, on a test file | Full title Mocha reports: the titles of the suites around a test, then its own |
 
-## How a project is run
+List the keys with `dagger list mochajs-projects -a`,
+`dagger list mochajs-test-files -a` and `dagger list mochajs-tests -a`. Each
+collection also has an all form, `--mochajs-projects`, `--mochajs-test-files`
+and `--mochajs-tests`. [Select collection items](/using/checking#select-collection-items)
+describes how to select items.
 
-1. **Install root.** Dependencies are installed at the nearest workspace root
-   at or above the project (a `pnpm-workspace.yaml`, or a `package.json` with
-   `"workspaces"`), else the nearest directory with a lockfile, else the
-   nearest `package.json`. That directory is mounted, without `node_modules`
-   and gitignored files, and Mocha runs with the project as its working
-   directory, so workspace siblings and shared configs resolve.
-2. **Package manager.** The `packageManager` setting, else the install root's
-   `package.json` `"packageManager"` field, else its lockfile
-   (`pnpm-lock.yaml`, `yarn.lock`, `bun.lock`/`bun.lockb`), else npm. pnpm and
-   Yarn run through corepack, which is installed when the image lacks it and
-   honours the `"packageManager"` version.
-3. **Install.** `<package manager> install` plus `installFlags`. Only the
-   files an install reads (every `package.json`, lockfiles, `.npmrc`,
-   `.yarnrc*`, `.yarn/releases`, `patches`, …, plus the directories that
-   `file:`, `link:` and `portal:` dependencies and pnpm's injected workspace
-   packages point at, and the files packages name in `"bin"`) are mounted for
-   it, so editing other source does not rerun it. When those directories cannot be worked out (a `package.json`
-   that is not valid JSON, or a path outside the install root), the whole
-   source is mounted instead. Package manager caches, and pnpm's store (passed
-   as `--store-dir`), live on cache volumes.
-   Playwright, Puppeteer and Cypress downloads and git hooks are skipped.
-4. **Build**, when `build` is set: `<package manager> run build`.
-5. **Mocha**: the project's own `node_modules/.bin/mocha`, looked up from the
-   project to the install root, with `environment` set and `timeout` applied.
-   A project with a `package.json` but no Mocha fails and says so; a project
-   with no `package.json` at or above it runs `npx mocha`.
+A project is a directory holding `.mocharc.js`, `.cjs`, `.mjs`, `.json`,
+`.jsonc`, `.yaml`, or `.yml`. Projects are found at or below the directory
+`dagger` runs from, plus the nearest project that encloses it; `node_modules`
+is not searched. A `mocha` key in `package.json` also configures Mocha, but
+every npm package has a `package.json`, so it does not root a project.
 
-A failure names its project and step, with the end of the output, e.g.
-`Mocha failed in app: install failed (npm install, exit 1): …` or
-`Mocha failed in app: mocha failed (exit 1): …`. The projects batch lists
-every failing project.
+Test files are found by one search over the project, reading the config's
+`spec`, `extension`, and `recursive` when they are literal values, and
+Mocha's default `./test` otherwise. A JavaScript config is not evaluated, so
+its options are not seen. Files inside a nested project belong to that
+project, and `node_modules`, `.git`, files ignored by `.gitignore`, and empty
+files are left out. A project with no test files has nothing to run; call its
+`test` function to run it anyway.
 
-## Selecting by directory
-
-Discovery starts from the directory you run Dagger in, so changing directory
-selects projects without any flag:
-
-- In a project's root: that project and the projects below it.
-- Anywhere inside a project, below its root: that project, plus any projects
-  below the current directory.
-- In a directory that belongs to no project: the projects below it.
-
-```console
-$ cd app/test && dagger check    # tests app, and only app
-```
-
-Project keys are always relative to the workspace root, wherever you run
-Dagger from.
-
-## Discovery
-
-A project is any directory holding a `.mocharc.*` file (`.js`, `.cjs`, `.mjs`,
-`.json`, `.jsonc`, `.yaml`, `.yml`); `node_modules` is not searched. A `mocha`
-key in `package.json` also configures Mocha, but every npm package has a
-`package.json`, so it does not mark a project.
-
-A project's test files are found without running Mocha or starting a container:
-one search (ripgrep) over the project, skipping `node_modules` and `.git`.
-Discovery reads the config Mocha would load (`.mocharc.cjs`, `.js`, `.yaml`,
-`.yml`, `.jsonc`, `.json`, in that order):
-
-- `spec`: a string or a list of globs, files, files without their extension,
-  and directories (`{a,b}` alternatives included). Without one, Mocha's
-  default spec, the `./test` directory.
-- A directory spec lists the files in it with the configured `extension`s
-  (`js`, `cjs` and `mjs` by default), and the files below it too when
-  `recursive` is set.
-
-Files inside a nested project belong to that project, not to the enclosing
-one. Keys are sorted. The limits of reading the config without running it:
-
-- A JavaScript config is not evaluated, so its `spec`, `extension` and
-  `recursive` are not seen and the defaults are listed instead. A
-  whole-project run still uses it, since that run is Mocha's own.
-- The `mocha` key of `package.json`, the `ignore` option, spec entries outside
-  the project, and the `test` script in `package.json` are not read.
-- Empty files are not listed.
-- A project whose spec matches no file lists no test files, so `dagger check`
-  does not run it. Call the project's `test` function to run it.
-
-The tests in those files are listed by Mocha itself: one
+The tests of a file come from Mocha itself: one
 `mocha --dry-run --reporter json` per project, which loads the test files
-without running a test or a hook, and reports every test it would run with
-its full title and its file. Titles are therefore the real ones, including
-those a file computes as it loads, and a test the config or the `flags`
-setting excludes is not listed. Keys keep Mocha's order. The cost:
+without running a test or a hook. The titles are the ones Mocha really uses,
+including those a file computes as it loads, and a test the config or the
+`flags` setting excludes is not a key. A file whose tests cannot be listed,
+because it throws while Mocha loads it or because the install failed, keeps
+the single key `*`, standing for the whole file: running it fails with the
+reason.
 
-- Listing tests installs the project's dependencies and starts a container,
-  unlike listing files. One dry run covers every file of a project.
-- One dry run covers a project, so a single file that throws while Mocha
-  loads it, or an install that fails, leaves every file of that project
-  without per-test keys. Each of them keeps a single key, `*`, standing for
-  the whole file: the files that do load still run their tests, and the one
-  that does not fails with the reason. Dagger needs every key before it runs
-  anything, so without that key one broken project would leave the whole
-  workspace with nothing to run.
-- A test file is keyed by title, so two tests in it with the same full title
-  share one key, and running it runs both.
-- The instrumentation is not loaded for a dry run, so listing records no
-  spans.
+Dependencies install at the nearest workspace root (a `pnpm-workspace.yaml`
+or a `package.json` with `workspaces`), else the nearest lockfile, else the
+nearest `package.json`. Mocha runs with the project as its working directory,
+through the project's own `node_modules/.bin/mocha`, so workspace siblings
+and shared configs resolve. A project with a `package.json` but no Mocha fails
+and says so; a project with no `package.json` at or above it runs
+`npx mocha`.
 
-## Settings
+To print the tests Mocha discovers in a project, call its `list` function:
 
-Set these in your `dagger.toml`:
+```bash
+dagger -c 'mochajs | projects | get app | list'
+```
+
+## Configure it
+
+List the current settings and their values with
+`dagger module settings mochajs`, then set one with
+`dagger module settings mochajs <key> <value>`. Settings are stored in
+`dagger.toml` under `[modules.mochajs.settings]` and apply to every project:
+
+- `packageManager` (default empty) is the package manager that installs
+  dependencies: `npm`, `pnpm`, `yarn`, or `bun`. Empty detects it from the
+  `packageManager` field of `package.json`, then from the lockfile, then uses
+  npm.
+- `baseImageAddress` (default `node:25-alpine`) is the Node base image tests
+  run in. Pin it to the project's Node version, for example `node:22-alpine`.
+  The default is Alpine (musl), so tools that download glibc binaries, such
+  as `mongodb-memory-server`, need a Debian-based image.
+- `build` (default `false`) runs the package's build script before testing.
+- `flags` (default empty) are extra flags passed to every `mocha` run, such
+  as `["--exit"]`.
+- `installFlags` (default empty) are extra flags for the install command,
+  such as `["--ignore-scripts"]`.
+- `environment` (default empty) sets environment variables for the build and
+  test steps, as `KEY=VALUE`.
+- `timeout` (default `1800`) is the number of seconds a Mocha run may take
+  before it is stopped and fails; `0` for no limit. A run that never ends
+  usually has a test that left a handle open (a server, a connection, a
+  timer): set `flags` to `["--exit"]`, or `exit: true` in the Mocha config.
 
 ```toml
-[modules.mochajs]
-source = "github.com/dagger/mochajs"
-
-# default: "node:25-alpine"; any image with Node.js
-settings.baseImageAddress = "node:22"
-
-# default: "" (detect per install root); or npm, pnpm, yarn, bun
-settings.packageManager = "pnpm"
-
-# default: false; run the package's build script before testing
-settings.build = true
-
-# default: []; extra flags passed to mocha
-settings.flags = ["--exit"]
-
-# default: []; extra flags passed to the install command
-settings.installFlags = ["--ignore-scripts"]
-
-# default: []; environment variables for Mocha, as KEY=VALUE
-settings.environment = ["MONGOMS_DISTRO=ubuntu-22.04"]
-
-# default: 1800; seconds a Mocha run may take, 0 for no limit
-settings.timeout = 3600
+[modules.mochajs.settings]
+baseImageAddress = "node:22-alpine"
+flags = ["--exit"]
+timeout = 3600
 ```
 
-Or from the CLI, where `dagger settings mochajs` lists them:
+The `test` script in `package.json` is not used, so flags it passes to Mocha
+belong in the Mocha config or in `flags`.
 
-```console
-$ dagger settings mochajs timeout 3600
-$ dagger settings mochajs flags -- --exit     # "--" before values that start with "-"
-$ dagger settings -u mochajs timeout          # unset: back to the default
-```
+## Working with other modules
 
-`timeout` bounds each Mocha run, so a run that never ends fails instead of
-holding `dagger check` forever. The default, 30 minutes, is well past what one
-project's suite normally takes, and short enough to catch a hang in CI. The
-usual cause of a hang is a test that leaves a handle open (a server, a
-database connection, a timer): Mocha waits for the process to empty before it
-exits. Many projects pass `--exit` in their `test` script for this; since that
-script is not used here, set `settings.flags = ["--exit"]` or put `exit: true`
-in the Mocha config.
+Use this module when Mocha is the test runner. Use Jest or Vitest instead for
+projects built around those runners.
 
-### Tips
+[source code](https://github.com/dagger/mochajs)
 
-- **Native binaries.** The default image is Alpine (musl). Tools that download
-  native binaries built for glibc, such as `mongodb-memory-server`, fail
-  there: use a Debian-based image (`settings.baseImageAddress = "node:22"`).
-  When the tool has no build for that distribution or architecture, point it
-  at one through `environment`, e.g. `MONGOMS_DISTRO=ubuntu-22.04` for
-  `mongodb-memory-server` on arm64.
-- **Calling functions from the CLI.** `dagger call` cannot navigate
-  collections yet; use the shell form:
-  `dagger -c 'mochajs | projects | get app | list'`. Run the tests with
-  `dagger check`, in CI especially: calling a check function through
-  `dagger call` or `dagger -c` does not fail the command when the check fails.
+---
 
 ## Using it from another module
 

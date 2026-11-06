@@ -130,10 +130,261 @@ type Mochajs {
   Strings in byte order.
   """
   let sorted(items: [String!]!): [String!]! {
-    let empty: [String!]! = []
-    items.reduce(empty) { acc, item =>
-      acc.takeWhile { x => x <= item } + [item] + acc.dropWhile { x => x <= item }
+    if (items.length < 2) {
+      items
+    } else {
+      let half = items.length / 2
+      mergeSorted(sorted(items.takeFirst(half)), sorted(items.dropFirst(half)))
     }
+  }
+
+  """
+  Two byte-ordered lists merged into one.
+  """
+  let mergeSorted(a: [String!]!, b: [String!]!): [String!]! {
+    let i = 0
+    let j = 0
+    (a + b).map { unused =>
+      if (j == b.length or (i < a.length and a[i]! <= b[j]!)) {
+        let item = a[i]!
+        i += 1
+        item
+      } else {
+        let item = b[j]!
+        j += 1
+        item
+      }
+    }
+  }
+
+  """
+  A literal string as a JavaScript regular expression, for Mocha's --grep.
+  """
+  let quoteRegex(text: String!): String! {
+    text.rewriteMatches(`[\\^$.|?*+()\[\]{}/-]`) { m => "\\" + m.string }
+  }
+
+  # Static reading of test files: only literal titles are honoured, and
+  # nothing here runs a container or Node. Offsets are byte offsets, so the
+  # source is made ASCII first. The scanning helpers come from the Jest
+  # module.
+
+  """
+  A JS string literal: single, double, or backtick without interpolation.
+  """
+  let stringLiteral: String! = `'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|` + "`" + `(?:[^` + "`" + `$\\]|\\[\s\S])*` + "`"
+
+  """
+  A JS regex literal body and flags.
+  """
+  let regexLiteral: String! = `/(?:[^/\\\n\[*]|\\.|\[(?:[^\]\\\n]|\\.)*\])(?:[^/\\\n\[]|\\.|\[(?:[^\]\\\n]|\\.)*\])*/[a-z]*`
+
+  """
+  Comments, strings and regex literals: everything whose brackets are not
+  code. A regex literal is recognized only after a character that can precede
+  an expression, captured so masking keeps it.
+  """
+  let tokenPattern: String! {
+    `//[^\n]*|/\*[\s\S]*?\*/|` + stringLiteral + `|([:\[,(=!&|?]\s*)` + regexLiteral
+  }
+
+  """
+  A run of n filler characters.
+  """
+  let fill(n: Int!, char: String!): String! {
+    "".padRight(n).replace(" ", char)
+  }
+
+  """
+  Byte length of an ASCII string.
+  """
+  let size(text: String!): Int! { text.split("").length }
+
+  """
+  The source with comments, strings and regex literals replaced by filler of
+  the same length, so offsets line up with the source while their brackets
+  vanish.
+  """
+  let mask(source: String!): String! {
+    source.rewriteMatches(Regexp(tokenPattern)) { m =>
+      let lead = m.captures[0] ?? ""
+      # Comments read as whitespace; literals as an opaque word.
+      let char = if (m.string.hasPrefix("/")) { " " } else { "_" }
+      lead + fill(m.end - m.start - size(lead), char)
+    }
+  }
+
+  """
+  A string literal's value, or null when text is anything else or holds an
+  escape other than a quote or a backslash, which the source does not spell
+  the way Mocha reports it.
+  """
+  let stringValue(text: String!): String {
+    let m = text.trimSpace.match(Regexp(`^(?:'((?:[^'\\\n]|\\.)*)'|"((?:[^"\\\n]|\\.)*)"|` + "`" + `([^` + "`" + `$\\]*)` + "`" + `)$`))
+    if (m == null) {
+      return null
+    }
+    let raw = m.captures.join("")
+    if (raw.containsMatch(Regexp(`\\[^'"\\` + "`" + `]`))) {
+      return null
+    }
+    raw.replaceMatches(`\\(.)`, with: "$1")
+  }
+
+  """
+  The key standing for the tests of a file that its source does not name.
+  """
+  let unnamedKey: String! = "*"
+
+  """
+  Suite and test functions of a Mocha interface, as regular expressions, or
+  null for an interface whose titles this does not read (qunit, exports, or
+  a custom one).
+  """
+  let interfaceCalls(ui: String!): {{suites: String!, tests: String!}} {
+    if (ui == "bdd") {
+      {{suites: "x?describe|x?context", tests: "x?it|x?specify"}}
+    } else if (ui == "tdd") {
+      {{suites: "suite", tests: "test"}}
+    } else {
+      null
+    }
+  }
+
+  """
+  The full titles a test file declares, as Mocha's --grep matches them: the
+  literal titles of the enclosing suites and of the test, joined by spaces,
+  in source order, with the number of test calls it cannot name and whether
+  it calls .only. A test is named only when its title is a string literal and
+  every scope around it is the file's top level, a plain block, or the
+  callback of a named suite: a test in a helper function, a loop or forEach
+  callback, a hook or another test is named by its caller at run time, and
+  one under if or else, in a loop body, try, catch, switch or a ternary may
+  not exist at all.
+  """
+  let testTitles(text: String!, ui: String!): {{titles: [String!]!, unnamed: Int!, only: Boolean!}}! {
+    let calls = interfaceCalls(ui)
+    let empty: [String!]! = []
+    if (calls == null) {
+      return {{titles: empty, unnamed: 1, only: false}}
+    }
+    let suites = calls!.suites
+    let tests = calls!.tests
+    let modifiers = `(?:\.(?:only|skip))*`
+    let source = text.replaceMatches(`[^\x00-\x7F]`, with: "?")
+    let masked = mask(source)
+    # Titles are read from the source, where the literals survive, and paired
+    # by offset with the calls found in the masked source, where brackets
+    # inside strings and comments are gone and the nesting is sound.
+    let literals = source
+      .matchAll(Regexp(`\b(?:` + suites + "|" + tests + `)` + modifiers + `\s*\(\s*(` + stringLiteral + `)\s*[,)]`))
+      .map { m =>
+        let value = stringValue(m.captures[0] ?? "") ?? ""
+        # A title prepare flattened is not the one Mocha reports.
+        # A literal "*" would be the unnamed key's.
+        let kept = if ((value.contains("?") and text.contains(value) == false) or value == unnamedKey) { "" } else { value }
+        {{start: m.start, name: kept}}
+      }
+    let frames: [{{kind: String!, ok: Boolean!, prefix: [String!]!, before: String!}}!]! = []
+    # The statement after one of these, or the block it opens, runs only
+    # sometimes, if at all.
+    let controlKeywords = ["if", "for", "while", "switch", "catch", "with"]
+    let tokens = Regexp(
+      `(=>\s*\{)|(\)\s*\{)|\b(else|try|finally|do)\s*\{|`
+        # What comes right before a call: the ) of an if or a loop, else, do,
+        # or a ternary's or a logical operator's operand.
+        + `(\)\s*|\b(?:else|do)\s+|[?:]\s*|&&\s*|\|\|\s*)?`
+        + `(\.\s*)?\b(?:(` + suites + `)|(` + tests + `)|([A-Za-z_$][\w$]*))` + modifiers + `\s*\(|[(){}]`,
+    )
+    let state = masked.matchAll(tokens).reduce({{stack: frames, out: empty, unnamed: 0}}) { st0, m =>
+      let lead = m.captures[3] ?? ""
+      # A ) before a call closes a paren first: the call is the statement of
+      # an if or a loop when that paren was the condition's.
+      let closing = lead.hasPrefix(")")
+      let popped = if (closing) { st0.stack.takeLast(1)[0] } else { null }
+      let st = if (closing) {
+        {{stack: st0.stack.dropLast(1), out: st0.out, unnamed: st0.unnamed}}
+      } else {
+        st0
+      }
+      let conditional = lead != "" and (closing == false or controlKeywords.contains(if (popped == null) { "" } else { popped!.before }))
+      let top = st.stack.takeLast(1)[0]
+      let ok = (if (top == null) { true } else { top!.ok }) and conditional == false
+      let prefix = if (top == null) { empty } else { top!.prefix }
+      let arrow = m.captures[0] ?? ""
+      let closeOpen = m.captures[1] ?? ""
+      let keywordOpen = m.captures[2] ?? ""
+      let dot = m.captures[4] ?? ""
+      let suite = m.captures[5] ?? ""
+      let test = m.captures[6] ?? ""
+      let word = m.captures[7] ?? ""
+      if (keywordOpen != "") {
+        # else, try, finally and do blocks run only sometimes.
+        {{
+          stack: st.stack + [{{kind: "block", ok: false, prefix: prefix, before: ""}}],
+          out: st.out,
+          unnamed: st.unnamed,
+        }}
+      } else if (arrow != "") {
+        # A function body: named only as a named suite's callback.
+        let named = top != null and top!.kind == "suite" and ok
+        {{
+          stack: st.stack + [{{kind: "fn", ok: named, prefix: prefix, before: ""}}],
+          out: st.out,
+          unnamed: st.unnamed,
+        }}
+      } else if (closeOpen != "") {
+        let rest = st.stack.dropLast(1)
+        let closed = if (top == null) { "" } else { top!.before }
+        let outer = rest.takeLast(1)[0]
+        let outerOk = if (outer == null) { true } else { outer!.ok }
+        let outerPrefix = if (outer == null) { empty } else { outer!.prefix }
+        let frame = if (controlKeywords.contains(closed)) {
+          # The block of an if, a loop, a switch or a catch.
+          {{kind: "block", ok: false, prefix: outerPrefix, before: ""}}
+        } else {
+          # function (...) { or a method: a function body.
+          let named = outer != null and outer!.kind == "suite" and outerOk
+          {{kind: "fn", ok: named, prefix: outerPrefix, before: ""}}
+        }
+        {{stack: rest + [frame], out: st.out, unnamed: st.unnamed}}
+      } else if (m.string == ")" or m.string == "}") {
+        {{stack: st.stack.dropLast(1), out: st.out, unnamed: st.unnamed}}
+      } else if (m.string == "{") {
+        {{
+          stack: st.stack + [{{kind: "block", ok: ok, prefix: prefix, before: ""}}],
+          out: st.out,
+          unnamed: st.unnamed,
+        }}
+      } else if (dot != "" or (suite == "" and test == "")) {
+        # A member call such as names.forEach(, a plain call, or a paren.
+        {{
+          stack: st.stack + [{{kind: "paren", ok: false, prefix: prefix, before: word}}],
+          out: st.out,
+          unnamed: st.unnamed,
+        }}
+      } else {
+        # The call starts after what came right before it.
+        let start = m.start + size(lead)
+        let name = literals.filter { l => l.start == start }.map { l => l.name }[0] ?? ""
+        let named = ok and name != ""
+        if (suite != "") {
+          {{
+            stack: st.stack + [{{kind: "suite", ok: named, prefix: prefix + [name], before: ""}}],
+            out: st.out,
+            unnamed: st.unnamed,
+          }}
+        } else {
+          {{
+            stack: st.stack + [{{kind: "test", ok: false, prefix: prefix, before: ""}}],
+            out: if (named) { st.out + [(prefix + [name]).join(" ")] } else { st.out },
+            unnamed: if (named) { st.unnamed } else { st.unnamed + 1 },
+          }}
+        }
+      }
+    }
+    let only = masked.containsMatch(Regexp(`\b(?:` + suites + "|" + tests + `)(?:\.skip)*\.only\b`))
+    {{titles: state.out.uniq, unnamed: state.unnamed, only: only}}
   }
 
   """
@@ -185,11 +436,16 @@ type Mochajs {
   }
 
   """
-  A literal string as a regular expression, for Mocha's --grep.
+  Config filenames in the order Mocha looks for them.
   """
-  let quoteRegex(text: String!): String! {
-    text.rewriteMatches(`[\\^$.|?*+()\[\]{}]`) { m => "\\" + m.string }
-  }
+  let configLookupOrder: [String!]! = [
+    ".mocharc.cjs",
+    ".mocharc.js",
+    ".mocharc.yaml",
+    ".mocharc.yml",
+    ".mocharc.jsonc",
+    ".mocharc.json",
+  ]
 
   """
   Workspace-root path of name inside dir.
@@ -290,6 +546,20 @@ type Mochajs {
   }
 
   """
+  The pinned image the module's own helpers run in, never the project's: it
+  builds the instrumentation and runs the report indexer.
+  """
+  let helperImage: String! = "oven/bun:1.3.0-alpine@sha256:37e6b1cbe053939bccf6ae4507977ed957eaa6e7f275670b72ad6348e0d2c11f"
+
+  """
+  The script that reads one shared Mocha run's JSON report and writes one
+  bounded result per selected test file. It needs no dependency.
+  """
+  let reportIndexer: File! {
+    currentModule.source.file("helpers/report-indexer.cjs")
+  }
+
+  """
   The OpenTelemetry instrumentation for Mocha, built from this repository with
   its runtime dependencies, preloaded from where it is mounted rather than
   installed into the project.
@@ -297,11 +567,11 @@ type Mochajs {
   let library: Directory! {
     # `tests` holds vendored checkouts that dwarf the library itself
     let module = currentModule.source.filter(
-      exclude: ["tests", ".dagger", "dist", "node_modules", "mochajs.dang"],
+      exclude: ["tests", ".dagger", "dist", "node_modules", "helpers", "mochajs.dang"],
     )
 
     container
-      .from("oven/bun:1.3.0-alpine@sha256:37e6b1cbe053939bccf6ae4507977ed957eaa6e7f275670b72ad6348e0d2c11f")
+      .from(helperImage)
       .withMountedCache("/root/.bun/install/cache", cacheVolume("library-node-modules"))
       .withEnvVariable("BUN_INSTALL_CACHE_DIR", "/root/.bun/install/cache")
       .withDirectory("/src", module)
@@ -348,7 +618,7 @@ type MochajsProjects @collection {
   test(ws: Workspace!): Void {
     # A selection over a list evaluates its elements concurrently, so all
     # project test runs happen in parallel.
-    let failures = paths.map { p => project(p) }.{{path, failure: testFailure(ws, [], [])}}
+    let failures = paths.map { p => project(p) }.{{path, failure: testFailure(ws, [], "")}}
       .filter { result => result.failure != null }
     if (failures.length > 0) {
       raise "Mocha failed in " + toString(failures.length) + " project(s):\n"
@@ -373,17 +643,240 @@ type MochajsProject {
   let tool: Mochajs!
 
   """
-  Test files in this project, keyed by project-relative path.
+  Test files in this project, keyed by project-relative path. They are found
+  from the source alone, with no container, so listing them never installs
+  dependencies or runs Mocha. A project whose discovery fails keeps one key,
+  its Mocha config, whose check fails with the reason; every other project is
+  unaffected.
   """
   testFiles(ws: Workspace!): MochajsTestFiles! {
-    MochajsTestFiles(files: testFilePaths(ws), project: self)
+    let failure = discoveryFailure(ws)
+    let empty: [String!]! = []
+    if (failure != null) {
+      let name = configName(ws)
+      MochajsTestFiles(
+        files: [name],
+        project: self,
+        discoveryError: failure,
+        entries: [fileEntry(name, empty, [tool.unnamedKey], false)],
+      )
+    } else {
+      let files = testFilePaths(ws)
+      let ui = interfaceName(ws)
+      let filter = userFilter(ws)
+      MochajsTestFiles(
+        files: files,
+        project: self,
+        discoveryError: null,
+        entries: files.map { file =>
+          let found = tool.testTitles(ws.file("/" + globPrefix + file).contents, ui)
+          # The settings' --grep, and the config's, exclude tests Mocha would
+          # never run, so they are no keys.
+          let kept = found.titles.filter { title => keeps(filter, title) }
+          let rest = if (found.unnamed > 0 or found.titles.length == 0) { [tool.unnamedKey] } else { empty }
+          fileEntry(file, found.titles, kept + rest, found.only)
+        },
+      )
+    }
+  }
+
+  let fileEntry(file: String!, statics: [String!]!, keys: [String!]!, only: Boolean!): MochajsTestFileSelection! {
+    MochajsTestFileSelection(
+      path: file,
+      tests: MochajsTests(titles: keys, statics: statics, only: only, path: file, project: self),
+    )
+  }
+
+  """
+  Whether Mocha fails a run that uses .only: --forbid-only in the settings'
+  flags, or forbidOnly in the config.
+  """
+  let forbidsOnly(ws: Workspace!): Boolean! {
+    let text = configText(ws) ?? ""
+    let configured = { (YAML.decode(text) :: {{forbidOnly: Boolean}}!).forbidOnly ?? false } rescue {
+      err: Error => false
+    }
+    tool.flags.contains("--forbid-only") or configured
+  }
+
+  """
+  The Mocha interface the project's tests are written in: the settings'
+  --ui, else the config's ui, else bdd. Empty when the config is JavaScript,
+  whose ui this cannot read.
+  """
+  let interfaceName(ws: Workspace!): String! {
+    let flag = flagValue(["--ui", "-u"])
+    if (flag != "") {
+      flag
+    } else if (configName(ws).hasSuffix("js")) {
+      ""
+    } else {
+      let text = configText(ws) ?? ""
+      let configured = { (YAML.decode(text) :: {{ui: String}}!).ui ?? "" } rescue {
+        err: Error => ""
+      }
+      if (configured == "") { "bdd" } else { configured }
+    }
+  }
+
+  """
+  The value of the first of the named flags in the settings' flags, or "".
+  """
+  let flagValue(names: [String!]!): String! {
+    tool.flags.reduce({{prev: "", value: ""}}) { st, arg =>
+      let joined = names.filter { n => n.hasPrefix("--") and arg.hasPrefix(n + "=") }
+      if (st.value != "") {
+        st
+      } else if (names.contains(st.prev)) {
+        {{prev: "", value: arg}}
+      } else if (joined.length > 0) {
+        {{prev: "", value: arg.trimPrefix(joined[0]! + "=")}}
+      } else {
+        {{prev: arg, value: ""}}
+      }
+    }.value
+  }
+
+  """
+  The test filter Mocha applies on its own: the settings' --grep, --fgrep
+  and --invert, else the config's grep, fgrep and invert.
+  """
+  let userFilter(ws: Workspace!): {{grep: String!, fgrep: String!, invert: Boolean!}}! {
+    let text = configText(ws) ?? ""
+    let configGrep = { (YAML.decode(text) :: {{grep: String}}!).grep ?? "" } rescue { err: Error => "" }
+    let configFgrep = { (YAML.decode(text) :: {{fgrep: String}}!).fgrep ?? "" } rescue { err: Error => "" }
+    let configInvert = { (YAML.decode(text) :: {{invert: Boolean}}!).invert ?? false } rescue { err: Error => false }
+    let flagGrep = flagValue(["--grep", "-g"])
+    let flagFgrep = flagValue(["--fgrep", "-f"])
+    let anyFlag = flagGrep != "" or flagFgrep != ""
+    let pattern = if (anyFlag) { flagGrep } else { configGrep }
+    # Mocha also takes --grep as /pattern/flags; the flags cannot be kept.
+    let slashed = pattern.match(`^/(.*)/[gimsuy]*$`)
+    {{
+      grep: if (slashed == null) { pattern } else { slashed!.captures[0] ?? "" },
+      fgrep: if (anyFlag) { flagFgrep } else { configFgrep },
+      invert: tool.flags.contains("--invert") or tool.flags.contains("-i") or configInvert,
+    }}
+  }
+
+  """
+  Whether Mocha's own filter keeps a test with this full title. A pattern
+  Go cannot compile keeps every title.
+  """
+  let keeps(filter: {{grep: String!, fgrep: String!, invert: Boolean!}}!, title: String!): Boolean! {
+    let matched = if (filter.fgrep != "") {
+      title.contains(filter.fgrep)
+    } else if (filter.grep != "") {
+      { title.containsMatch(Regexp(filter.grep)) } rescue {
+        err: Error => filter.invert == false
+      }
+    } else {
+      true
+    }
+    if (filter.grep == "" and filter.fgrep == "") { true } else { matched != filter.invert }
+  }
+
+  """
+  Mocha's own filter as a lookahead at the start of a full title, so it can
+  join a --grep that replaces it.
+  """
+  let userCondition(ws: Workspace!): String! {
+    let filter = userFilter(ws)
+    let pattern = if (filter.fgrep != "") { tool.quoteRegex(filter.fgrep) } else { filter.grep }
+    if (pattern == "") {
+      ""
+    } else if (filter.invert) {
+      "(?![\\s\\S]*?(?:" + pattern + "))"
+    } else {
+      "(?=[\\s\\S]*?(?:" + pattern + "))"
+    }
+  }
+
+  """
+  The settings' flags without Mocha's test filter, which a --grep of the
+  module's own replaces.
+  """
+  let unfilteredFlags: [String!]! {
+    let empty: [String!]! = []
+    tool.flags.reduce({{skip: false, out: empty}}) { st, arg =>
+      if (st.skip) {
+        {{skip: false, out: st.out}}
+      } else if (["--grep", "-g", "--fgrep", "-f"].contains(arg)) {
+        {{skip: true, out: st.out}}
+      } else if (arg.hasPrefix("--grep=") or arg.hasPrefix("--fgrep=") or arg == "--invert" or arg == "-i") {
+        {{skip: false, out: st.out}}
+      } else {
+        {{skip: false, out: st.out + [arg]}}
+      }
+    }.out
+  }
+
+  """
+  One anchored --grep over the selected tests, or "" when the selection
+  needs none: the sorted titles of the selected named tests, and for each
+  file whose unnamed tests are selected, every title but that file's named
+  ones. Mocha's own filter joins it as a lookahead.
+  """
+  let grepFor(ws: Workspace!, selected: [MochajsTestSelection!]!): String! {
+    let empty: [String!]! = []
+    let named = tool.sorted(
+      selected.reduce(empty) { acc, s => acc + s.keys.filter { k => k != tool.unnamedKey } }.uniq,
+    )
+    let rest = tool.sorted(
+      selected
+        .filter { s => s.keys.contains(tool.unnamedKey) }
+        .map { s =>
+          if (s.statics.length == 0) { "" } else {
+            "(?!(?:" + s.statics.map { t => tool.quoteRegex(t) }.join("|") + ")$)"
+          }
+        }
+        .uniq,
+    )
+    if (rest.contains("")) {
+      # Some file's unnamed tests are all of its tests: everything matches,
+      # so Mocha's own filter is left to apply as it is.
+      ""
+    } else {
+      let alternatives = (if (named.length == 0) { empty } else {
+        ["(?:" + named.map { t => tool.quoteRegex(t) }.join("|") + ")$"]
+      }) + rest
+      "^" + userCondition(ws) + "(?:" + alternatives.join("|") + ")"
+    }
+  }
+
+  """
+  Why this project's test files cannot be found, naming the file, or null:
+  a JSON or YAML Mocha config that does not parse, or a search that fails.
+  """
+  let discoveryFailure(ws: Workspace!): String {
+    let name = configName(ws)
+    let text = configText(ws)
+    let config = if (text == null) {
+      null
+    } else if (name.hasSuffix(".yaml") or name.hasSuffix(".yml")) {
+      { YAML.decode(text ?? "") :: {{}}!; null } rescue {
+        err: Error => "cannot read " + tool.join(path, name) + ": " + err.message
+      }
+    } else {
+      { JSON.decode(text ?? "") :: {{}}!; null } rescue {
+        err: Error => "cannot read " + tool.join(path, name) + ": " + err.message
+      }
+    }
+    if (config != null) {
+      config
+    } else {
+      { testFilePaths(ws); null } rescue {
+        err: Error => "cannot search " + path + " for test files: " + err.message
+      }
+    }
   }
 
   """
   Run this project's tests.
   """
   test(ws: Workspace!): Void {
-    let failure = testFailure(ws, [], [])
+    let empty: [String!]! = []
+    let failure = testFailure(ws, empty, "")
     if (failure != null) {
       raise "Mocha failed in " + path + ": " + (failure ?? "")
     }
@@ -391,7 +884,8 @@ type MochajsProject {
   }
 
   """
-  List the tests of this project.
+  List the tests of this project, as mocha --dry-run reports them. A plain
+  function: listing checks never calls it.
   """
   list(ws: Workspace!): String! {
     let ran = dryRun(ws, [])
@@ -426,33 +920,25 @@ type MochajsProject {
 
   """
   Why this project's tests failed, naming the step, or null when they pass:
-  the whole project when files is empty, else only the named files, and only
-  the tests with the named full titles when titles is not empty. It never
-  raises, so a batch reports every project.
+  the whole project when files is empty, else only the named files, narrowed
+  by grep when it is not empty. It never raises, so testing every project
+  reports every failing one.
   """
-  let testFailure(ws: Workspace!, files: [String!]!, titles: [String!]!): String {
+  let testFailure(ws: Workspace!, files: [String!]!, grep: String!): String {
     {
       let install = installFailure(ws)
-      if (install != null) { install } else { toolFailure(testExec(ws, files, titles), "mocha") }
+      if (install != null) { install } else { toolFailure(testExec(ws, files, grep), "mocha") }
     } rescue {
       err: Error => err.message
     }
   }
 
   """
-  Run the given test files, naming this project when they fail.
-  """
-  let runFiles(ws: Workspace!, files: [String!]!): Void {
-    let empty: [String!]! = []
-    runTests(ws, files, empty)
-  }
-
-  """
-  Run the tests with the given full titles in the given test files, naming
+  Run the given test files, narrowed by grep when it is not empty, naming
   this project when they fail.
   """
-  let runTests(ws: Workspace!, files: [String!]!, titles: [String!]!): Void {
-    let failure = testFailure(ws, files, titles)
+  let runFiles(ws: Workspace!, files: [String!]!, grep: String!): Void {
+    let failure = testFailure(ws, files, grep)
     if (failure != null) {
       raise "Mocha failed in " + path + ": " + (failure ?? "")
     }
@@ -461,23 +947,178 @@ type MochajsProject {
 
   """
   Container that has run this project's tests: the whole project, as its own
-  Mocha config selects them, when files is empty, else only the named files,
-  narrowed to the named full titles when titles is not empty.
+  Mocha config selects them, when files is empty, else only the named files.
   """
-  let testExec(ws: Workspace!, files: [String!]!, titles: [String!]!): Container! {
+  let testExec(ws: Workspace!, files: [String!]!, grep: String!): Container! {
     let empty: [String!]! = []
-    # Mocha matches --grep against a test's full title. Anchoring it keeps a
-    # title that another one starts with from pulling that one in, and it
-    # comes after the settings' flags so a --grep there does not win.
-    let selection = if (titles.length == 0) { empty } else {
-      ["--grep", "^(" + titles.map { title => tool.quoteRegex(title) }.join("|") + ")$"]
+    testEnv(ws, grep).withExec(
+      mocha(ws, mochaArgs(files, grep, empty)),
+      daggerInDaggerNewSession: true,
+      expect: ReturnType.ANY,
+    )
+  }
+
+  """
+  Mocha's arguments for only the named files: the project's config without
+  its spec, which Mocha would add to the files named on the command line,
+  and with a --grep of the module's own in place of Mocha's filter when grep
+  is not empty.
+  """
+  let filesArgs(grep: String!): [String!]! {
+    let base = ["--config", filesConfigPath, "--no-package"]
+    if (grep == "") { base + tool.flags } else { base + unfilteredFlags + ["--grep", grep] }
+  }
+
+  """
+  Mocha's arguments: the whole project, as its own Mocha config selects it,
+  when files is empty, else only the named files. extra comes before the
+  files.
+  """
+  let mochaArgs(files: [String!]!, grep: String!, extra: [String!]!): [String!]! {
+    if (files.length == 0) { tool.flags + extra } else { filesArgs(grep) + extra + files }
+  }
+
+  """
+  Where the shared run writes Mocha's report and output, and where the run
+  that takes each file alone writes its own.
+  """
+  let reportPath: String! = "/dagger-mocha/report.json"
+  let stdoutPath: String! = "/dagger-mocha/stdout.log"
+  let stderrPath: String! = "/dagger-mocha/stderr.log"
+  let eachScriptPath: String! = "/dagger-mocha/each.sh"
+  let eachPath: String! = "/dagger-mocha/each"
+
+  """
+  One Mocha run and report shared by every selected test file of this
+  project. Everything here depends only on the workspace and the selection,
+  never on the check asking, so every check of the project builds the same
+  command and Dagger runs it once.
+  """
+  let runTests(ws: Workspace!, selection: MochajsTestFiles!): MochajsTestResults! {
+    if (selection.discoveryError != null) {
+      raise "Mocha failed in " + path + ": " + (selection.discoveryError ?? "")
     }
-    let args = if (files.length == 0) { tool.flags } else {
-      ["--config", filesConfigPath, "--no-package"] + tool.flags + selection + files
+    let discovered = selection
+      .entries
+      .filter { entry => selection.files.contains(entry.path) }
+      .map { entry =>
+        MochajsTestSelection(
+          file: entry.path,
+          keys: entry.tests.titles,
+          statics: entry.tests.statics,
+          only: entry.tests.only,
+          narrowed: entry.tests.narrowed,
+        )
+      }
+    # In key order, which discovery sorted and a selection keeps.
+    let selected = discovered.filter { s => s.keys.length > 0 }
+    if (selected.length == 0) {
+      raise "no tests selected in Mocha project " + path
     }
-    runner(ws)
-      .withNewFile(filesConfigPath, filesConfig)
-      .withEnvVariable("DAGGER_MOCHA_CACHE_BUSTER", UUID.v7)
+    let install = installFailure(ws)
+    if (install != null) {
+      raise "Mocha failed in " + path + ": " + (install ?? "")
+    }
+    let empty: [String!]! = []
+    let narrowedTests = discovered.any { s => s.narrowed }
+    # With nothing selected out anywhere, run the project as its Mocha config
+    # selects it. Without a delta, naming the files is the safe choice.
+    let whole = selection.narrowed == false and narrowedTests == false
+    let files = selected.map { s => s.file }
+    let named = if (whole) { empty } else { files }
+    # Every check of the project evaluates this, so titles are only gathered
+    # for the run that needs them.
+    let grep = if (narrowedTests) { grepFor(ws, selected) } else { "" }
+    let executed = testEnv(ws, grep).withExec(
+      mocha(ws, mochaArgs(named, grep, ["--reporter", "json", "--reporter-option", "output=" + reportPath])),
+      daggerInDaggerNewSession: true,
+      expect: ReturnType.ANY,
+      redirectStdout: stdoutPath,
+      redirectStderr: stderrPath,
+    )
+    let code = executed.exitCode
+    let shared = executed
+      .directory("/dagger-mocha")
+      .filter(include: ["report.json", "stdout.log", "stderr.log"])
+    # A .only in any file of the run leaves Mocha's other tests out, and
+    # Mocha passes the run; under forbidOnly, Mocha fails it instead.
+    let only = forbidsOnly(ws) == false
+    let first = index(selected, shared, code, "shared", only)
+    # Mocha loads every file before it runs one, so a file that throws while
+    # loading stops the whole run with no report. Only then, run each
+    # selected file alone, in one more shared run, so the file that broke
+    # fails and the others report their own tests.
+    let results = if (first.glob("aborted").length == 0) {
+      first
+    } else {
+      let each = testEnv(ws, grep)
+        .withNewFile(eachScriptPath, eachScript)
+        .withExec(
+          ["sh", eachScriptPath, eachPath] + files + ["--"] + mocha(ws, filesArgs(grep)),
+          daggerInDaggerNewSession: true,
+          expect: ReturnType.ANY,
+        )
+      index(selected, shared.withDirectory("each", each.directory(eachPath)), code, "each", only)
+    }
+    MochajsTestResults(results: results, selections: selected, project: path)
+  }
+
+  """
+  One result per selected test, by the positions of its file and its key in
+  the selection, written by the
+  report indexer in its own pinned image from the run's report and output.
+  """
+  let index(selected: [MochajsTestSelection!]!, inputs: Directory!, code: Int!, mode: String!, onlyAllowed: Boolean!): Directory! {
+    let header = if (code == 124) {
+      timeoutFailure("mocha")
+    } else {
+      "mocha failed (exit " + toString(code) + ")"
+    }
+    container
+      .from(tool.helperImage)
+      .withFile("/usr/local/lib/report-indexer.cjs", tool.reportIndexer)
+      .withDirectory("/in", inputs)
+      .withNewFile(
+        "/in/selection.json",
+        JSON.encode(selected.map { s => {{file: s.file, keys: s.keys, statics: s.statics, only: s.only}} }),
+      )
+      .withExec([
+        "bun", "/usr/local/lib/report-indexer.cjs",
+        "--mode", mode,
+        "--only-allowed", if (onlyAllowed) { "true" } else { "false" },
+        "--in", "/in",
+        "--exit-code", toString(code),
+        "--header", header,
+        "--prefix", tool.containerPath(path) + "/",
+        "--out", "/out",
+      ])
+      .directory("/out")
+  }
+
+  """
+  Run each test file named before "--" alone with the command after it,
+  writing <dir>/<position>.json, .log and .code for each.
+  """
+  let eachScript: String! =
+    "out=$1\nshift\nn=0\n"
+      + "while [ \"$1\" != \"--\" ]; do eval \"f_$n=\\$1\"; n=$((n+1)); shift; done\n"
+      + "shift\nmkdir -p \"$out\"\ni=0\n"
+      + "while [ \"$i\" -lt \"$n\" ]; do\n"
+      + "  eval \"f=\\$f_$i\"\n"
+      + "  \"$@\" --reporter json --reporter-option \"output=$out/$i.json\" \"$f\" >\"$out/$i.log\" 2>&1\n"
+      + "  echo \"$?\" >\"$out/$i.code\"\n"
+      + "  i=$((i+1))\n"
+      + "done\n"
+
+  """
+  The runner, ready to run Mocha's tests. Nothing in it changes from one
+  run to the next, so unchanged inputs reuse the cached result.
+  """
+  let testEnv(ws: Workspace!, grep: String!): Container! {
+    let base = runner(ws).withNewFile(filesConfigPath, filesConfig)
+    # With a --grep of the module's own, the config's filter must not join or
+    # invert it.
+    (if (grep == "") { base } else { base.withEnvVariable("DAGGER_MOCHA_OWN_GREP", "1") })
       # A test that uses a Dagger SDK opens a session from inside this
       # container, and a session finds its workspace root by walking up to a
       # .git directory. Without one it gets an empty workspace, so every
@@ -493,11 +1134,11 @@ type MochajsProject {
       # only reads _EXPERIMENTAL_DAGGER_CLI_BIN, so keep setting it until those
       # are out of support.
       .withEnvVariable("_EXPERIMENTAL_DAGGER_CLI_BIN", "/dev/.dagger/dagger")
-      .withExec(
-        mocha(ws, args),
-        daggerInDaggerNewSession: true,
-        expect: ReturnType.ANY,
-      )
+  }
+
+  let timeoutFailure(step: String!): String! {
+    step + " did not finish within " + toString(tool.timeout)
+      + "s. If its tests had finished and the process kept running, something left a handle open (a server, a connection, a timer): set flags to [\"--exit\"], or exit: true in the Mocha config. Otherwise raise the timeout setting."
   }
 
   """
@@ -510,8 +1151,7 @@ type MochajsProject {
     } else if (code == 127) {
       ran.stderr.trim(" \n")
     } else if (code == 124) {
-      step + " did not finish within " + toString(tool.timeout)
-        + "s. If its tests had finished and the process kept running, something left a handle open (a server, a connection, a timer): set flags to [\"--exit\"], or exit: true in the Mocha config. Otherwise raise the timeout setting."
+      timeoutFailure(step)
     } else {
       let output = (ran.stdout.trim(" \n") + "\n" + ran.stderr.trim(" \n")).trim(" \n")
       step + " failed (exit " + toString(code) + "):\n" + output.split("\n").takeLast(15).join("\n")
@@ -549,6 +1189,11 @@ type MochajsProject {
   }
   delete config.spec;
   delete config._;
+  if (process.env.DAGGER_MOCHA_OWN_GREP === "1") {
+    delete config.grep;
+    delete config.fgrep;
+    delete config.invert;
+  }
   module.exports = config;
   ```
 
@@ -927,75 +1572,21 @@ type MochajsProject {
     )
   }
 
-  """
-  Where the dry run writes its report. The json reporter writes to a file
-  rather than to stdout, which anything the test files print while loading
-  would otherwise share.
-  """
-  let testListPath: String! = "/dagger-mocha/tests.json"
-
-  """
-  Every test Mocha would run, with the absolute path of the file it is in.
-  One dry run covers the whole project, so listing the tests of each file
-  costs one container per project rather than one per file. Titles come from
-  Mocha itself, so the ones it computes as it loads the files are listed as
-  they will appear, and a test the config or the settings' flags exclude is
-  not listed at all.
-  """
-  let testIndex(ws: Workspace!): [{{file: String!, fullTitle: String!}}!]! {
-    let ran = dryRun(
-      ws,
-      ["--reporter", "json", "--reporter-option", "output=" + testListPath],
-    )
-    let failure = toolFailure(ran, "mocha --dry-run")
-    if (failure != null) {
-      raise "Mocha could not list the tests of " + path + ": " + (failure ?? "")
-    }
-    let listed = JSON.decode(ran.file(testListPath).contents) :: {{
-      tests: [{{file: String!, fullTitle: String!}}!]!,
-    }}!
-    listed.tests
-  }
-
-  """
-  Full titles of the tests in a project-relative test file, in the order
-  Mocha reports them. The runner mirrors the workspace, so the paths Mocha
-  reports resolve under the project root.
-
-  A file whose tests Mocha cannot list keeps the unlisted key instead: Dagger
-  needs every key before it runs anything, so raising here would leave the
-  whole workspace, including the projects that are fine, with nothing to run.
-  """
-  let testTitles(ws: Workspace!, file: String!): [String!]! {
-    let prefix = tool.containerPath(path) + "/"
-    {
-      testIndex(ws)
-        .filter { entry => entry.file.trimPrefix(prefix) == file }
-        .map { entry => entry.fullTitle }
-        # Two tests can share a full title; the one key then runs both.
-        .uniq
-    } rescue {
-      err: Error => [unlistedKey]
-    }
-  }
-
-  """
-  The only key of a test file whose tests Mocha could not list: it stands for
-  the whole file, and running it fails with the reason the listing did.
-  """
-  let unlistedKey: String! = "*"
-
-  # Test files are found with one ripgrep search over the project, rather than
-  # by asking Mocha, so listing them runs no container and never walks
-  # node_modules. Only what Mocha reads from a JSON or YAML config is followed:
-  # a JS config is not evaluated, the `mocha` key of package.json and the
-  # `ignore` option are not read, and a project whose config cannot be read
-  # statically is assumed to use Mocha's defaults. Empty files, which hold no
-  # tests, are not listed.
+  # Test files are found with ripgrep searches over the project, rather than
+  # by asking Mocha, so listing them runs no container, installs nothing and
+  # never walks node_modules. Only what Mocha reads from a JSON or YAML config
+  # is followed: spec, extension, recursive and ignore. A JS config is not
+  # evaluated and the `mocha` key of package.json is not read, so such a
+  # project is assumed to use Mocha's defaults. A file is a test file only
+  # when it calls describe, context, suite, it, specify or test, so helpers in
+  # the spec are not listed. Where this still disagrees with Mocha, a listed
+  # file Mocha runs no test from fails as not run, and a failure in a file
+  # Mocha runs but this did not list fails every check of the project.
   let testFilePaths(ws: Workspace!): [String!]! {
     let text = configText(ws)
     let specs = if (text == null) { null } else { specOption(text ?? "") }
     let extensions = if (text == null) { null } else { extensionOption(text ?? "") }
+    let ignored = if (text == null) { null } else { ignoreOption(text ?? "") }
     let recursive = if (text == null) { false } else { recursiveOption(text ?? "") }
     let empty: [String!]! = []
     let globs = (specs ?? ["./test"]).reduce(empty) { acc, spec =>
@@ -1004,17 +1595,24 @@ type MochajsProject {
     if (globs.length == 0) {
       empty
     } else {
-      # The same search finds the configs of nested projects, whose files are
-      # theirs rather than this project's.
+      let excluded = (ignored ?? empty)
+        .map { glob => glob.trimPrefix("./") }
+        .filter { glob => glob.hasPrefix("/") == false and glob.hasPrefix("../") == false }
+        .map { glob => "!/" + globPrefix + glob }
       let found = ws.search(
         paths: [absolutePath],
-        globs: globs + ["/" + globPrefix + "**/.mocharc.*", "!node_modules", "!.git"],
+        globs: globs + excluded + ["!node_modules", "!.git"],
+        pattern: `\b(describe|context|suite|it|specify|test)(\.(only|skip))?\s*\(`,
+        filesOnly: true,
+      ).{{filePath}}.map { match => relativePath(match.filePath) }
+      # Nested projects own the files below them.
+      let nested = ws.search(
+        paths: [absolutePath],
+        globs: ["/" + globPrefix + "**/.mocharc.*", "!node_modules", "!.git"],
         pattern: "",
         filesOnly: true,
-      ).{{filePath}}.map { match =>
-        match.filePath.trimPrefix("/").trimPrefix("./").trimPrefix(globPrefix)
-      }
-      let nested = found
+      ).{{filePath}}
+        .map { match => relativePath(match.filePath) }
         .filter { file => file.contains("/") and isConfigFile(file) }
         .map { file => file.split("/").dropLast(1).join("/") + "/" }
       tool.sorted(
@@ -1025,6 +1623,10 @@ type MochajsProject {
           .uniq,
       )
     }
+  }
+
+  let relativePath(found: String!): String! {
+    found.trimPrefix("/").trimPrefix("./").trimPrefix(globPrefix)
   }
 
   """
@@ -1064,21 +1666,22 @@ type MochajsProject {
   }
 
   """
-  The config file Mocha loads for this project, in Mocha's own lookup order,
-  as JSON or YAML text; null when there is none or it is JavaScript.
+  The name of the config file Mocha loads for this project, in Mocha's own
+  lookup order.
   """
-  let configText(ws: Workspace!): String {
+  let configName(ws: Workspace!): String! {
     let present = ws.glob(globPrefix + ".mocharc.*").map { m =>
       m.trimPrefix("/").trimPrefix("./").trimPrefix(globPrefix)
     }
-    let loaded = [
-      ".mocharc.cjs",
-      ".mocharc.js",
-      ".mocharc.yaml",
-      ".mocharc.yml",
-      ".mocharc.jsonc",
-      ".mocharc.json",
-    ].filter { name => present.contains(name) }.takeFirst(1).join("")
+    tool.configLookupOrder.filter { name => present.contains(name) }.takeFirst(1).join("")
+  }
+
+  """
+  The config file Mocha loads for this project, as JSON or YAML text; null
+  when there is none or it is JavaScript.
+  """
+  let configText(ws: Workspace!): String {
+    let loaded = configName(ws)
     if (loaded == "" or loaded.hasSuffix("js")) {
       null
     } else {
@@ -1136,6 +1739,24 @@ type MochajsProject {
   }
 
   """
+  The config's ignore globs, as a list whether Mocha was given a string or a
+  list; null when it is unset or neither.
+  """
+  let ignoreOption(text: String!): [String!] {
+    {
+      let config = YAML.decode(text) :: {{ignore: [String!]}}!
+      config.ignore
+    } rescue {
+      err: Error => {
+        let config = YAML.decode(text) :: {{ignore: String}}!
+        if (config.ignore == null) { null } else { [config.ignore ?? ""] }
+      } rescue {
+        err: Error => null
+      }
+    }
+  }
+
+  """
   Whether the config asks Mocha to read spec directories recursively.
   """
   let recursiveOption(text: String!): Boolean! {
@@ -1160,38 +1781,71 @@ type MochajsTestFiles @collection {
   """
   Test files selected in or out since the collection was discovered.
   """
-  delta: CollectionDelta
+  delta: CollectionDelta @delta
+
+  """
+  Whether the active selection removed test files from this collection.
+  """
+  narrowed: Boolean! { delta == null or delta!.removedKeys.length > 0 }
+
+  """
+  Stored test collections for the files. The engine filters these
+  collections too when it passes a selected set of test files.
+  """
+  entries: [MochajsTestFileSelection!]!
 
   let project: MochajsProject!
+
+  """
+  Why the project's test files could not be found, or null. Its only key is
+  then the project's Mocha config, whose check fails with this.
+  """
+  let discoveryError: String
 
   """
   The test file at this path.
   """
   file(path: String!): MochajsTestFile! @get {
-    MochajsTestFile(path: path, project: project)
+    MochajsTestFile(
+      path: path,
+      project: project,
+      tests: entries.filter { entry => entry.path == path }[0]!.tests,
+    )
   }
 
   """
   Run the selected test files in this project. A plain function, not a check:
-  the tests of each file are a collection of their own, and its check runs
-  them, so dagger check does not run the same tests twice.
+  each test is a check, so dagger check does not run the same tests twice.
   """
   test(ws: Workspace!): Void {
+    if (discoveryError != null) {
+      raise "Mocha failed in " + project.path + ": " + (discoveryError ?? "")
+    }
     # With nothing selected out, run the project as Mocha's own config selects
     # it rather than naming every file. Without a delta, naming the files is
     # the safe choice.
-    let whole = if (delta == null) {
-      false
-    } else {
-      delta.addedKeys.length == 0 and delta.removedKeys.length == 0
-    }
-    if (whole) {
+    if (narrowed == false) {
       project.test(ws)
     } else if (files.length > 0) {
-      project.runFiles(ws, files)
+      project.runFiles(ws, files, "")
     }
     null
   }
+}
+
+"""
+A test file and its tests, as stored in its project's test files.
+"""
+type MochajsTestFileSelection {
+  """
+  Test file path, relative to the project root.
+  """
+  path: String!
+
+  """
+  The tests in this file.
+  """
+  tests: MochajsTests!
 }
 
 """
@@ -1206,82 +1860,87 @@ type MochajsTestFile {
   let project: MochajsProject!
 
   """
-  The tests in this file, keyed by the full title Mocha reports.
+  The tests in this file, keyed by the full title Mocha reports, plus "*"
+  for the tests the source does not name.
   """
-  tests(ws: Workspace!): MochajsTests! {
-    MochajsTests(titles: project.testTitles(ws, path), file: self)
-  }
+  tests: MochajsTests!
 
   """
-  Run the Mocha tests in a test file. A plain function, not a check: the
-  tests collection below it holds the check.
+  Run the Mocha tests in this test file. A plain function, not a check: the
+  tests below it are the checks.
   """
   test(ws: Workspace!): Void {
-    project.runFiles(ws, [path])
-  }
-
-  """
-  Run the tests with these full titles.
-  """
-  let runTests(ws: Workspace!, titles: [String!]!): Void {
-    # The unlisted key stands for the whole file, which is what reports why
-    # its tests could not be listed.
-    if (titles == [project.unlistedKey]) {
-      project.runFiles(ws, [path])
-    } else {
-      project.runTests(ws, [path], titles)
-    }
-    null
+    project.runFiles(ws, [path], "")
   }
 }
 
 """
-Tests in a Mocha test file, keyed by the full title Mocha reports: the titles
-of the suites around a test and its own, joined by spaces.
+Tests in a Mocha test file, keyed by the full title --grep matches: the
+literal titles of the suites around a test and its own, joined by spaces.
+The key "*" stands for the file's tests whose titles the source does not
+spell out (made in a loop, a helper or a forEach callback, or by a suite
+whose title is not a literal).
 """
 type MochajsTests @collection {
   """
-  Full titles, in the order Mocha reports them.
+  Full titles, in source order, then "*" when the file has unnamed tests.
   """
   titles: [String!]! @keys
 
   """
   Tests selected in or out since the collection was discovered.
   """
-  delta: CollectionDelta
-
-  let file: MochajsTestFile!
+  delta: CollectionDelta @delta
 
   """
-  The test with this full title.
+  Whether the active selection removed tests from this collection.
+  """
+  narrowed: Boolean! { delta == null or delta!.removedKeys.length > 0 }
+
+  """
+  Every full title the source names, so that "*" can stand for the others.
+  """
+  let statics: [String!]!
+
+  """
+  Whether the file calls .only, which in Mocha holds every file of the run.
+  """
+  let only: Boolean!
+
+  """
+  Test file path, relative to the project root.
+  """
+  let path: String!
+
+  let project: MochajsProject!
+
+  """
+  The test with this full title, or "*".
   """
   named(title: String!): MochajsTest! @get {
-    MochajsTest(title: title, file: file)
+    MochajsTest(title: title, path: path, project: project)
   }
 
   """
-  Run the selected tests of this file.
+  Run the selected tests of this file. A plain function, not a check: each
+  test is a check, so dagger check does not run the same tests twice.
   """
-  test(ws: Workspace!): Void @check {
-    # With nothing selected out, run the file and let Mocha select the tests
-    # in it rather than naming every one. Without a delta, naming them is the
-    # safe choice.
-    let whole = if (delta == null) {
-      false
-    } else {
-      delta.addedKeys.length == 0 and delta.removedKeys.length == 0
-    }
-    if (whole) {
-      file.test(ws)
+  test(ws: Workspace!): Void {
+    if (narrowed == false) {
+      project.runFiles(ws, [path], "")
     } else if (titles.length > 0) {
-      file.runTests(ws, titles)
+      let grep = project.grepFor(
+        ws,
+        [MochajsTestSelection(file: path, keys: titles, statics: statics, only: only, narrowed: true)],
+      )
+      project.runFiles(ws, [path], grep)
     }
     null
   }
 }
 
 """
-A Mocha test.
+A Mocha test, or "*", the tests of its file the source does not name.
 """
 type MochajsTest {
   """
@@ -1289,12 +1948,65 @@ type MochajsTest {
   """
   title: String!
 
-  let file: MochajsTestFile!
+  """
+  Test file path, relative to the project root.
+  """
+  let path: String!
+
+  let project: MochajsProject!
 
   """
-  Run this test.
+  Run this test. Every selected test of a project shares one Mocha run, and
+  this check reports only its own result from it.
   """
-  test(ws: Workspace!): Void @check {
-    file.runTests(ws, [title])
+  test(ws: Workspace!, selection: MochajsTestFiles!): Void @check {
+    project.runTests(ws, selection).assertPassed(path, title)
+  }
+}
+
+"""
+The selected tests of one test file, as the shared run was given them.
+"""
+type MochajsTestSelection {
+  let file: String!
+  let keys: [String!]!
+  let statics: [String!]!
+  let only: Boolean!
+  let narrowed: Boolean!
+}
+
+"""
+One result per selected test, written by the shared indexer, each small
+whatever the size of Mocha's report.
+"""
+type MochajsTestResults {
+  let results: Directory!
+  let selections: [MochajsTestSelection!]!
+
+  """
+  The project root, for messages.
+  """
+  let project: String!
+
+  """
+  Raise this test's failure, if any. Results are filed by the positions of
+  the file and the key in the selection, which every check of the run
+  received identically, so titles never become file names.
+  """
+  let assertPassed(file: String!, title: String!): Void {
+    let fileIndex = selections.takeWhile { s => s.file != file }.length
+    if (fileIndex == selections.length) {
+      raise "Mocha test file is outside the test selection: " + file
+    }
+    let keys = selections[fileIndex]!.keys
+    let keyIndex = keys.takeWhile { k => k != title }.length
+    if (keyIndex == keys.length) {
+      raise "Mocha test is outside the selection: " + title
+    }
+    let failure = results.file(toString(fileIndex) + "/" + toString(keyIndex)).contents
+    if (failure != "") {
+      raise "Mocha failed in " + project + ": " + failure
+    }
+    null
   }
 }

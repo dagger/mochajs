@@ -67,20 +67,20 @@ type E2E {
 
   """
   Run every test file of the only project in a workspace, as one whole-project
-  batch, and report its outcome.
+  run, and report its outcome.
   """
   let wholeOutcome(tool: Mochajs!, ws: Workspace!, key: String!): String! {
     filesOutcome(ws, tool.projects(ws).get(key: key).testFiles(ws))
   }
 
   """
-  The failure of running these test files, or "passed". The project and test
-  file functions raise rather than returning a Check: only the tests of a
-  file are checks, so that dagger check runs them once.
+  The failure of running these test files, or "passed". The project and
+  test files functions raise rather than returning a Check: only a test file
+  is a check, so that dagger check runs it once.
   """
   let filesOutcome(ws: Workspace!, files: MochajsTestFiles!): String! {
     {
-      files.batch.test(ws)
+      files.test(ws)
       "passed"
     } rescue {
       err: Error => err.message
@@ -88,11 +88,28 @@ type E2E {
   }
 
   """
-  The failure of running this test file, or "passed".
+  The failure of running one test file of files, through the plain function,
+  or "passed".
   """
-  let fileOutcome(ws: Workspace!, file: MochajsTestFile!): String! {
+  let fileOutcome(ws: Workspace!, files: MochajsTestFiles!, file: String!): String! {
+    filesOutcome(ws, files.subset(keys: [file]))
+  }
+
+  """
+  The check of one test, sharing a run with the other tests of selection.
+  Direct calls do not apply dagger check's filtered view, so the selection
+  is explicit.
+  """
+  let leaf(ws: Workspace!, selection: MochajsTestFiles!, file: String!, title: String!): Check! {
+    selection.get(key: file).tests.get(key: title).test(ws, selection: selection)
+  }
+
+  """
+  The failure of running these tests of one file, or "passed".
+  """
+  let testsOutcome(ws: Workspace!, tests: MochajsTests!): String! {
     {
-      file.test(ws)
+      tests.test(ws)
       "passed"
     } rescue {
       err: Error => err.message
@@ -342,23 +359,23 @@ type E2E {
     let ws = project.asWorkspace
     let projects = mochajs.projects(ws)
     assertPaths(projects.keys, ["."], "sample project discovery")
-    projects.batch.test(ws)
+    projects.test(ws)
 
     let files = projects.get(key: ".").testFiles(ws)
     assertPaths(files.keys, ["test/index.test.js"], "sample test file discovery")
-    files.batch.test(ws)
+    files.test(ws)
 
     let file = files.get(key: "test/index.test.js")
     file.test(ws)
 
-    let tests = file.tests(ws)
+    let tests = file.tests
     assertPaths(
       tests.keys,
       [suite + " passes", suite + " nested suite also passes"],
       "sample test discovery",
     )
-    run(tests.batch.test(ws))
-    run(tests.get(key: suite + " nested suite also passes").test(ws))
+    tests.test(ws)
+    run(leaf(ws, files, "test/index.test.js", suite + " nested suite also passes"))
     null
   }
 
@@ -525,8 +542,8 @@ type E2E {
   """
   Projects form a collection keyed by project root. get builds the project at
   a key; subset keeps parent order, rejects unknown and duplicate keys, and
-  narrows what get accepts and what the batch runs; an empty subset is valid
-  and runs nothing.
+  narrows what get accepts and what its test function runs; an empty subset
+  is valid and runs nothing.
   """
   collectionCheck: Void @check {
     let ws = siblings
@@ -539,7 +556,7 @@ type E2E {
 
     let pair = all.subset(keys: ["c", "a"])
     assert(pair.keys == ["a", "c"], "subset did not keep parent order: " + pair.keys.join(", "))
-    pair.batch.test(ws)
+    pair.test(ws)
 
     let outside = { pair.get(key: "b").path } rescue {
       err: Error => "rejected"
@@ -558,13 +575,13 @@ type E2E {
 
     let none = all.subset(keys: [])
     assert(none.keys.length == 0, "empty subset kept keys: " + none.keys.join(", "))
-    none.batch.test(ws)
+    none.test(ws)
 
-    let failure = { all.batch.test(ws); "unexpected success" } rescue {
+    let failure = { all.test(ws); "unexpected success" } rescue {
       err: Error => err.message
     }
-    assert(failure.contains("- b:"), "batch test did not name the failing project: " + failure)
-    assert(failure.contains("- a:") == false, "batch test named a passing project: " + failure)
+    assert(failure.contains("- b:"), "projects test did not name the failing project: " + failure)
+    assert(failure.contains("- a:") == false, "projects test named a passing project: " + failure)
     null
   }
 
@@ -573,8 +590,9 @@ type E2E {
   the spec of a JSON or YAML config (a string or a list; globs, brace
   alternatives, files with or without their extension, and directories),
   `extension` and `recursive` for a directory spec, and Mocha's default
-  `./test` otherwise. A nested project's files, node_modules and empty files
-  are left out, and the keys are sorted.
+  `./test` otherwise, minus the config's `ignore`. A nested project's files,
+  node_modules and files that declare no suite or test are left out, and the
+  keys are sorted.
   """
   testFileDiscoveryCheck: Void @check {
     let ws = directory
@@ -612,6 +630,15 @@ type E2E {
       .withNewFile("defaults/test/d.ts", testSource)
       .withNewFile("defaults/test/deep/e.js", testSource)
       .withNewFile("defaults/other/f.js", testSource)
+      # A helper in the spec declares no test, so it is not a test file.
+      .withNewFile("defaults/test/helper.js", "module.exports = { it: 1 };\n")
+      .withNewFile("defaults/test/suite.js", "describe.only(\"suite\", () => {});\n")
+      .withNewFile(
+        "ignored/.mocharc.yml",
+        "spec: \"test/**/*.js\"\nignore:\n  - \"test/fixtures/**\"\n",
+      )
+      .withNewFile("ignored/test/a.js", testSource)
+      .withNewFile("ignored/test/fixtures/b.js", testSource)
       .withNewFile("outer/.mocharc.yml", "spec: \"test/**/*.js\"\n")
       .withNewFile("outer/test/a.js", testSource)
       .withNewFile("outer/test/inner/.mocharc.yml", "{}\n")
@@ -627,7 +654,8 @@ type E2E {
     # A comment marker inside a JSON string is not a comment.
     assertTestFiles(ws, "globbed", ["test/b.spec.js", "test/unit/a.spec.js"])
     assertTestFiles(ws, "commented", ["spec/a.ts", "spec/deep/b.ts"])
-    assertTestFiles(ws, "defaults", ["test/a.js", "test/b.cjs", "test/c.mjs"])
+    assertTestFiles(ws, "defaults", ["test/a.js", "test/b.cjs", "test/c.mjs", "test/suite.js"])
+    assertTestFiles(ws, "ignored", ["test/a.js"])
     assertTestFiles(ws, "outer", ["test/a.js"])
     assertTestFiles(ws, "outer/test/inner", ["test/b.js"])
 
@@ -642,9 +670,10 @@ type E2E {
   }
 
   """
-  Test file contents for discovery, which only lists non-empty files.
+  Test file contents for discovery, which only lists files that declare a
+  suite or a test.
   """
-  let testSource: String! = "// a test\n"
+  let testSource: String! = "it(\"works\", () => {});\n"
 
   """
   Fail unless the project at path offers exactly the wanted test files, in
@@ -659,9 +688,10 @@ type E2E {
   }
 
   """
-  A project's test files form a collection: with nothing filtered out, the
-  batch runs the project as Mocha's own config selects it; a subset, or one
-  file, runs only its own files, even though the config's spec covers more.
+  A project's test files form a collection: with nothing filtered out, its
+  test function runs the project as Mocha's own config selects it; a subset
+  that leaves files out runs only its own files, even though the config's
+  spec covers more.
   """
   testFilesCheck: Void @check {
     let ws = cjsProject.withNewFile("test/broken.test.js", failingTest).asWorkspace
@@ -677,14 +707,14 @@ type E2E {
     )
     let subset = filesOutcome(ws, files.subset(keys: ["test/index.test.js"]))
     assert(subset == "passed", "the passing file as a subset: " + subset)
-    let single = fileOutcome(ws, files.get(key: "test/index.test.js"))
+    let single = fileOutcome(ws, files, "test/index.test.js")
     assert(single == "passed", "the passing file on its own: " + single)
     assert(
       filesOutcome(ws, files.subset(keys: ["test/broken.test.js"])) != "passed",
       "the failing file passed as a subset",
     )
     assert(
-      fileOutcome(ws, files.get(key: "test/broken.test.js")) != "passed",
+      fileOutcome(ws, files, "test/broken.test.js") != "passed",
       "the failing file passed on its own",
     )
     let none = filesOutcome(ws, files.subset(keys: []))
@@ -709,119 +739,195 @@ type E2E {
       filesOutcome(hidden, hiddenFiles) != "passed",
       "the whole run did not use Mocha's own config",
     )
-    let listedFile = fileOutcome(hidden, hiddenFiles.get(key: "test/index.test.js"))
-    assert(listedFile == "passed", "the listed file under a JS config: " + listedFile)
+    # A JS config hides its interface, so the file has only "*". With nothing
+    # selected out, its check shares that whole run too, and the
+    # unlisted file's failure, which no check owns, fails it.
+    let listedFile = outcome(leaf(hidden, hiddenFiles, "test/index.test.js", "*"))
+    assert(
+      listedFile.contains("failures in test files without selected test checks: extra/broken.js"),
+      "the listed file under a JS config: " + listedFile,
+    )
     null
   }
 
   """
-  A test file's tests form a collection keyed by the full title Mocha
-  reports, listed by a dry run rather than by reading the source: a title
-  Mocha computes as it loads the file is listed as it will appear. With
-  nothing selected out the batch runs the whole file; a subset, or one test,
-  runs only the tests selected, anchored to their full title so a title
-  another one starts with does not pull that one in.
+  Each test is a check. The checks of a project share one Mocha run of their
+  selection, and each reports only its own test: the passing test passes
+  while another fails, and a test outside the selection is refused.
+  """
+  leafCheck: Void @check {
+    let ws = cjsProject.withNewFile("test/broken.test.js", failingTest).asWorkspace
+    let files = mochajs.projects(ws).get(key: ".").testFiles(ws)
+    run(leaf(ws, files, "test/index.test.js", "cjs fixture passes"))
+    let broken = outcome(leaf(ws, files, "test/broken.test.js", "broken fails"))
+    assert(
+      broken.contains("broken fails failed") and broken.contains("1 == 2"),
+      "the failing test did not fail on its own: " + broken,
+    )
+    let outside = outcome(
+      files.get(key: "test/broken.test.js").tests.get(key: "broken fails").test(
+        ws,
+        selection: files.subset(keys: ["test/index.test.js"]),
+      ),
+    )
+    assert(
+      outside.contains("outside the test selection"),
+      "a test outside its selection: " + outside,
+    )
+    null
+  }
+
+  """
+  A test file's tests form a collection keyed by the full title --grep
+  matches, read from the source: literal titles of the suites around a test
+  and its own. A test whose title is made at run time is under the key "*".
+  With nothing selected out the file runs whole; a subset runs only the tests
+  selected, anchored to their full title so a title another one starts with
+  does not pull that one in, and "*" runs the file's unnamed tests.
   """
   testsCheck: Void @check {
     let ws = cjsProject
       .withNewFile("test/dimension.test.js", dimensionTests)
       .asWorkspace
-    let file = mochajs
-      .projects(ws)
-      .get(key: ".")
-      .testFiles(ws)
-      .get(key: "test/dimension.test.js")
-    let tests = file.tests(ws)
+    let files = mochajs.projects(ws).get(key: ".").testFiles(ws)
+    let tests = files.get(key: "test/dimension.test.js").tests
     assert(
-      tests.keys == [
-        "dimension passes",
-        "dimension passes twice",
-        "dimension a|b",
-        "dimension fails",
-      ],
+      tests.keys == ["dimension passes", "dimension passes twice", "dimension fails", "*"],
       "tests: " + tests.keys.join(", "),
     )
-
-    assert(failed(tests.batch.test(ws)), "the whole file run missed the failing test")
-    run(tests.subset(keys: ["dimension passes", "dimension a|b"]).batch.test(ws))
-    run(tests.get(key: "dimension passes").test(ws))
+    assert(testsOutcome(ws, tests) != "passed", "the whole file run missed the failing test")
+    let subset = testsOutcome(ws, tests.subset(keys: ["dimension passes", "*"]))
+    assert(subset == "passed", "a passing subset: " + subset)
+    let none = testsOutcome(ws, tests.subset(keys: []))
+    assert(none == "passed", "an empty subset: " + none)
+    run(leaf(ws, files, "test/dimension.test.js", "dimension passes"))
+    run(leaf(ws, files, "test/dimension.test.js", "*"))
+    let twice = outcome(leaf(ws, files, "test/dimension.test.js", "dimension passes twice"))
     assert(
-      failed(tests.get(key: "dimension passes twice").test(ws)),
-      "the failing test passed on its own",
+      twice.contains("dimension passes twice failed"),
+      "the failing test did not fail on its own: " + twice,
     )
-    run(tests.subset(keys: []).batch.test(ws))
-
-    # Only the file the tests belong to runs, even though the project's spec
-    # covers more.
-    let other = mochajs
-      .projects(ws)
-      .get(key: ".")
-      .testFiles(ws)
-      .get(key: "test/index.test.js")
-      .tests(ws)
-    run(other.batch.test(ws))
     null
   }
 
   """
-  A project whose tests Mocha cannot list still has something to run: each of
-  its files keeps the unlisted key, running it reports why, and the projects
-  that are fine are untouched. Dagger needs every key before it runs
-  anything, so a project that cannot list its tests must not raise.
+  Static titles, without a container: suites nest, a template literal
+  without interpolation names a test, and a test is named only when every
+  scope around it is the file, a block or a named suite's callback. Tests in
+  a forEach callback, a loop with a computed title, a helper function, an
+  arrow helper, or a suite with a computed title are under "*". The tdd
+  interface names suite and test; the exports interface and a JavaScript
+  config, whose interface is not read, leave every file at "*".
   """
-  unlistableTestsCheck: Void @check {
+  parserCheck: Void @check {
+    let bdd = "describe(\"outer\", () => {\n"
+      + "  it(\"plain\", () => {});\n"
+      + "  // it(\"commented\", () => {});\n"
+      + "  describe('inner (x)', function () {\n"
+      + "    it(`tpl`, async () => { const s = \"it('in string')\"; });\n"
+      + "    if (process.env.X) { it(\"conditional\", () => {}); }\n"
+      + "  });\n"
+      + "  [\"a\", \"b\"].forEach((n) => { it(\"each \" + n, () => {}); it(\"fixed\", () => {}); });\n"
+      + "  for (const n of [1]) { it(`loop ${n}`, () => {}); }\n"
+      + "  it.skip(\"skipped\", () => {});\n"
+      + "  xit(\"pending\");\n"
+      + "  context(\"ctx\", () => it(\"arrow\", () => {}));\n"
+      + "  beforeEach(() => { it(\"in a hook\", () => {}); });\n"
+      + "});\n"
+      + "function helper(name) { it(name, () => {}); it(\"literal in helper\", () => {}); }\n"
+      + "const make = () => { it(\"made\", () => {}); };\n"
+      + "describe(\"dyn \" + 1, () => { it(\"under dynamic\", () => {}); });\n"
+    let named = "describe(\"only\", () => { it(\"one\", () => {}); });\n"
+    # Tests that run only sometimes, if at all, are not named; a plain block
+    # and a statement after a call on the line before are.
+    let conditional = "describe(\"c\", () => {\n"
+      + "  it(\"plain\", () => {});\n"
+      + "  { it(\"blocked\", () => {}); }\n"
+      + "  if (process.env.X) { it(\"if braced\", () => {}); } else { it(\"else braced\", () => {}); }\n"
+      + "  if (process.env.X) it(\"if bare\", () => {});\n"
+      + "  else it(\"else bare\", () => {});\n"
+      + "  try { it(\"in try\", () => {}); } catch (e) { it(\"in catch\", () => {}); } finally { it(\"in finally\", () => {}); }\n"
+      + "  switch (1) { case 1: it(\"in switch\", () => {}); }\n"
+      + "  process.env.X ? it(\"ternary a\", () => {}) : it(\"ternary b\", () => {});\n"
+      + "  process.env.X && it(\"and\", () => {});\n"
+      + "  while (false) it(\"while bare\", () => {});\n"
+      + "  Math.max()\n"
+      + "  it(\"after a call\", () => {});\n"
+      + "});\n"
+    let tree = directory
+      .withNewFile("bdd/.mocharc.json", "{\"spec\": \"test/*.js\"}\n")
+      .withNewFile("bdd/test/a.js", bdd)
+      .withNewFile("bdd/test/b.js", named)
+      .withNewFile("bdd/test/c.js", conditional)
+      .withNewFile("tdd/.mocharc.yml", "spec: test/*.js\nui: tdd\n")
+      .withNewFile("tdd/test/c.js", "suite(\"tdd\", function () {\n  test(\"works\", function () {});\n  suiteSetup(() => {});\n});\n")
+      .withNewFile("exports/.mocharc.json", "{\"ui\": \"exports\"}\n")
+      .withNewFile("exports/test/d.js", named)
+      .withNewFile("js/.mocharc.js", "module.exports = {};\n")
+      .withNewFile("js/test/e.js", named)
+    let ws = tree.asWorkspace
+    let a = keys(ws, "bdd", "test/a.js")
+    assert(
+      a == ["outer plain", "outer inner (x) tpl", "outer skipped", "outer pending", "outer ctx arrow", "*"],
+      "bdd titles: " + a.join(", "),
+    )
+    assert(keys(ws, "bdd", "test/b.js") == ["only one"], "a fully named file has no *")
+    let c = keys(ws, "bdd", "test/c.js")
+    assert(c == ["c plain", "c blocked", "c after a call", "*"], "conditional titles: " + c.join(", "))
+    assert(keys(ws, "tdd", "test/c.js") == ["tdd works"], "tdd titles: " + keys(ws, "tdd", "test/c.js").join(", "))
+    assert(keys(ws, "exports", "test/d.js") == ["*"], "exports ui: " + keys(ws, "exports", "test/d.js").join(", "))
+    assert(keys(ws, "js", "test/e.js") == ["*"], "JS config: " + keys(ws, "js", "test/e.js").join(", "))
+    let flagged = mochajs(flags: ["--ui", "tdd"]).projects(ws).get(key: "bdd").testFiles(ws).get(key: "test/b.js").tests.keys
+    assert(flagged == ["*"], "the --ui flag was not read: " + flagged.join(", "))
+    null
+  }
+
+  """
+  The test keys of a file of a project.
+  """
+  let keys(ws: Workspace!, project: String!, file: String!): [String!]! {
+    mochajs.projects(ws).get(key: project).testFiles(ws).get(key: file).tests.keys
+  }
+
+  """
+  A test file whose titles exercise the selector: one title that another
+  starts with, one computed as the file loads, which the source does not
+  name, and two failing tests.
+  """
+  let dimensionTests: String! =
+    "const assert = require(\"node:assert\");\n\ndescribe(\"dimension\", () => {\n  it(\"passes\", () => {});\n  it(\"passes twice\", () => {\n    assert.equal(1, 2);\n  });\n  for (const name of [\"a|b\"]) {\n    it(name, () => {});\n  }\n  it(\"fails\", () => {\n    assert.equal(1, 2);\n  });\n});\n"
+
+  """
+  A file that throws while Mocha loads it stops Mocha's whole run, since
+  Mocha loads every file before it runs one. Its checks fail with the
+  reason, and the other files of the project still report their own tests,
+  from a run of each file alone; listing never loads a file, so it is
+  unaffected, and so are the other projects.
+  """
+  loadFailureCheck: Void @check {
     let ws = directory
       .withDirectory("good", cjsProject)
       .withDirectory("bad", cjsProject)
-      # A file that throws while Mocha loads it, which fails the dry run of
-      # the whole project, so no file of it can list its tests.
       .withNewFile(
         "bad/test/broken.test.js",
         "describe(\"broken\", () => { it(\"syntax error\"  => {}); });\n",
       )
       .asWorkspace
     let badFiles = mochajs.projects(ws).get(key: "bad").testFiles(ws)
-
-    # The file that throws reports it, through the key that stands for the
-    # whole file.
-    let brokenTests = badFiles.get(key: "test/broken.test.js").tests(ws)
-    assert(brokenTests.keys == ["*"], "unlisted tests: " + brokenTests.keys.join(", "))
-    let why = outcome(brokenTests.batch.test(ws))
-    assert(why.contains("Mocha failed in bad"), "the unlisted file did not say why: " + why)
     assert(
-      failed(brokenTests.get(key: "*").test(ws)),
-      "the unlisted key passed instead of running the file",
+      badFiles.keys == ["test/broken.test.js", "test/index.test.js"],
+      "test files of the broken project: " + badFiles.keys.join(", "),
     )
-
-    # Its siblings lose their per-test keys, since one dry run covers the
-    # project, but still run.
-    let siblingTests = badFiles.get(key: "test/index.test.js").tests(ws)
-    assert(siblingTests.keys == ["*"], "sibling tests: " + siblingTests.keys.join(", "))
-    run(siblingTests.batch.test(ws))
-
-    # The healthy project lists and runs as usual.
-    let goodTests = mochajs
-      .projects(ws)
-      .get(key: "good")
-      .testFiles(ws)
-      .get(key: "test/index.test.js")
-      .tests(ws)
-    assertPaths(
-      goodTests.keys,
-      ["cjs fixture passes", "cjs fixture nested suite also passes"],
-      "tests of the healthy project",
+    let why = outcome(leaf(ws, badFiles, "test/broken.test.js", "*"))
+    assert(
+      why.contains("test/broken.test.js failed on its own") and why.contains("SyntaxError"),
+      "the file that throws did not say why: " + why,
     )
-    run(goodTests.batch.test(ws))
+    run(leaf(ws, badFiles, "test/index.test.js", "cjs fixture passes"))
+    let goodFiles = mochajs.projects(ws).get(key: "good").testFiles(ws)
+    run(leaf(ws, goodFiles, "test/index.test.js", "cjs fixture passes"))
     null
   }
-
-  """
-  A test file whose titles exercise the selector: one title that another
-  starts with, one computed as the file loads, one holding a regular
-  expression metacharacter, and one failing test.
-  """
-  let dimensionTests: String! =
-    "const assert = require(\"node:assert\");\n\ndescribe(\"dimension\", () => {\n  it(\"passes\", () => {});\n  it(\"passes twice\", () => {\n    assert.equal(1, 2);\n  });\n  for (const name of [\"a|b\"]) {\n    it(name, () => {});\n  }\n  it(\"fails\", () => {\n    assert.equal(1, 2);\n  });\n});\n"
 
   """
   Mocha 12 is ESM and renamed the config loaders a filtered run borrows, so a
@@ -844,8 +950,7 @@ type E2E {
       files.keys == ["test/broken.test.js", "test/index.test.js"],
       "test files: " + files.keys.join(", "),
     )
-    let file = files.get(key: "test/index.test.js")
-    let single = fileOutcome(ws, file)
+    let single = fileOutcome(ws, files, "test/index.test.js")
     assert(single == "passed", "the passing file on its own: " + single)
     let subset = filesOutcome(ws, files.subset(keys: ["test/index.test.js"]))
     assert(subset == "passed", "the passing file as a subset: " + subset)
@@ -854,34 +959,25 @@ type E2E {
       "the whole project run missed the failing file",
     )
 
-    # Mocha 12 renamed the config loaders a filtered run borrows, so the
-    # per-test selector is checked against it too.
-    let tests = file.tests(ws)
-    assert(
-      tests.keys == ["esm fixture passes", "esm fixture nested suite also passes"],
-      "tests: " + tests.keys.join(", "),
-    )
-    run(tests.get(key: "esm fixture passes").test(ws))
+    # The checks name their files too, so they borrow the loaders as well.
+    run(leaf(ws, files.subset(keys: ["test/index.test.js"]), "test/index.test.js", "esm fixture passes"))
     null
   }
 
   """
   Settings apply to every run: flags reach Mocha whether the project runs
-  whole or file by file. They reach the dry run that lists tests too, so a
-  test the flags exclude is not a key.
+  whole or file by file, and a --grep in them leaves the tests it excludes
+  without a key.
   """
   settingsCheck: Void @check {
     let ws = cjsProject.withNewFile("test/broken.test.js", failingTest).asWorkspace
     let files = mochajs(flags: ["--grep", "passes"]).projects(ws).get(key: ".").testFiles(ws)
     let whole = filesOutcome(ws, files)
     assert(whole == "passed", "flags on a whole run: " + whole)
-    let broken = files.get(key: "test/broken.test.js")
-    let filtered = fileOutcome(ws, broken)
+    let filtered = fileOutcome(ws, files, "test/broken.test.js")
     assert(filtered == "passed", "flags on a file run: " + filtered)
-    assert(
-      broken.tests(ws).keys.length == 0,
-      "flags did not reach the dry run: " + broken.tests(ws).keys.join(", "),
-    )
+    let keys = files.get(key: "test/broken.test.js").tests.keys
+    assert(keys.length == 0, "--grep in flags left keys: " + keys.join(", "))
     null
   }
 
@@ -893,23 +989,23 @@ type E2E {
 
   """
   Whether testing every project visible from `cwd` observed the failure
-  planted in `tree`, through the project batch and through the test file
-  checks of each project.
+  planted in `tree`, through the projects' test function and through the test
+  files of each project.
   """
   let testFailed(tree: Directory!, cwd: String!): Boolean! {
     let ws = tree.asWorkspace(cwd: cwd)
     let all = mochajs.projects(ws)
-    let batch = {
-      all.batch.test(ws)
+    let whole = {
+      all.test(ws)
       false
     } rescue true
-    let checks = all.keys.any { key =>
+    let perProject = all.keys.any { key =>
       filesOutcome(ws, all.get(key: key).testFiles(ws)) != "passed"
     }
-    if (batch != checks) {
-      raise "the project batch and the test file checks disagreed from " + cwd
+    if (whole != perProject) {
+      raise "the projects and their test files disagreed from " + cwd
     }
-    batch
+    whole
   }
 
   """
@@ -956,6 +1052,466 @@ type E2E {
       raise "testing from work should have run the enclosing project"
     }
 
+    null
+  }
+
+  # Only the unindented CHECKS header counts: nested TESTS summaries count the
+  # Mocha tests, which can be right even when the checks are attributed wrong.
+  let checkSummaryMatches(output: String!, passed: Int!, failed: Int!): Boolean! {
+    let headers = output.split("\n").filter { line =>
+      line.hasPrefix("CHECKS ") or line.hasPrefix("== CHECKS ==")
+    }
+    let empty: [String!]! = []
+    let expected = (if (failed > 0) { ["✘", toString(failed), "failed"] } else { empty })
+      + (if (passed > 0) { ["✔", toString(passed), "passed"] } else { empty })
+    headers.length == 1 and headers[0]!.trimPrefix("== ").trimPrefix("CHECKS").trimPrefix(" ==")
+      .trimSpace.split(" ").filter { word => word != "" } == expected
+  }
+
+  """
+  The check totals the selection checks assert are read from the CHECKS
+  header alone.
+  """
+  selectedSummaryCheck: Void @check {
+    let wrong = "CHECKS  ✘ 8 failed\n  TESTS\n    ✘ 1 failed\n    ✔ 7 passed\n"
+    assert(checkSummaryMatches(wrong, 7, 1) == false, "nested test counts hid failed checks")
+    assert(checkSummaryMatches(wrong, 0, 8), "zero passing checks were not recognized")
+    assert(checkSummaryMatches("CHECKS  ✔ 18 passed\n", 8, 0) == false, "accepted a partial count")
+    assert(checkSummaryMatches("CHECKS  ✘ 1 failed  ✔ 7 passed\n", 7, 1), "mixed counts were not recognized")
+    assert(checkSummaryMatches("== CHECKS ==  ✔ 8 passed\n", 8, 0), "agent report was not recognized")
+    assert(checkSummaryMatches("  CHECKS  ✔ 8 passed\n", 8, 0) == false, "accepted a nested header")
+    null
+  }
+
+  """
+  Run dagger check over a fixture workspace that installs this repository's
+  module, with the engine's own CLI in a session of its own. Direct Dang
+  calls do not apply dagger check's filtered view of the collections, so
+  selection is only exercised through the CLI.
+  """
+  let selectedRun(ws: Workspace!, fixture: Directory!, args: [String!]!): Container! {
+    container
+      .from("alpine:3.23")
+      # Test file discovery searches the workspace on the client, with
+      # ripgrep when it is there; busybox grep cannot stand in for it.
+      .withExec(["apk", "add", "--no-cache", "ripgrep"])
+      .withEnvVariable("NO_COLOR", "1")
+      .withDirectory(
+        "/source",
+        ws.directory("/", exclude: ["**/node_modules", ".git", ".dagger", "dist", "tests"]),
+      )
+      .withDirectory("/work", fixture)
+      .withNewFile("/work/.git/HEAD", "ref: refs/heads/main\n")
+      .withNewFile("/work/dagger.toml", "[modules.mochajs]\nsource = \"/source\"\n")
+      .withWorkdir("/work")
+      .withExec(
+        ["/dev/.dagger/dagger", "check"] + args,
+        expect: ReturnType.ANY,
+        daggerInDaggerNewSession: true,
+      )
+  }
+
+  let selectedCheck(
+    ws: Workspace!,
+    fixture: Directory!,
+    args: [String!]!,
+    passed: Int!,
+    failed: Int! = 0,
+    messages: [String!]! = [],
+  ): Void {
+    let result = selectedRun(ws, fixture, ["--progress=report"] + args)
+    let output = result.stdout + result.stderr
+    assert((result.exitCode == 0) == (failed == 0), "unexpected check exit status:\n" + output)
+    assert(checkSummaryMatches(output, passed, failed), "unexpected Dagger check totals:\n" + output)
+    messages.map { message =>
+      assert(output.contains(message), "missing " + message + ":\n" + output)
+    }
+    null
+  }
+
+  """
+  A test file of one suite.
+  """
+  let suiteFile(body: String!): String! {
+    "const assert = require(\"node:assert\");\n\ndescribe(\"suite\", () => {\n" + body + "});\n"
+  }
+
+  let passingTests: String! = "  it(\"foo\", () => {});\n  it(\"bar\", () => {});\n"
+
+  """
+  A Mocha project at root whose test files hold the given sources.
+  """
+  let selectionProject(tree: Directory!, root: String!, files: [String!]!, source: String!): Directory! {
+    files.reduce(
+      tree
+        .withNewFile(root + "/package.json", packageJson("commonjs", "^11.7.5", ""))
+        .withNewFile(root + "/.mocharc.json", "{\"spec\": \"test/*.test.js\"}\n"),
+    ) { acc, file => acc.withNewFile(root + "/" + file, source) }
+  }
+
+  """
+  Two projects, a and b, of three test files each: x and y pass, and z fails
+  if it runs.
+  """
+  let selectionFixture: Directory! {
+    ["a", "b"].reduce(directory) { tree, root =>
+      selectionProject(tree, root, ["test/x.test.js", "test/y.test.js"], suiteFile(passingTests))
+        .withNewFile(
+          root + "/test/z.test.js",
+          suiteFile("  it(\"other\", () => { assert.fail(\"excluded file ran\"); });\n"),
+        )
+    }
+  }
+
+  let selectionArgs: [String!]! = ["--mochajs-test-file=test/x.test.js", "--mochajs-test-file=test/y.test.js"]
+
+  """
+  Two projects of two selected test files of two tests: eight checks, and
+  the excluded file does not run.
+  """
+  selectedTestsCheck(ws: Workspace!): Void @check {
+    selectedCheck(ws, selectionFixture, selectionArgs, passed: 8)
+  }
+
+  """
+  Selecting a project runs every test in it, and only in it.
+  """
+  selectedProjectCheck(ws: Workspace!): Void @check {
+    selectedCheck(
+      ws,
+      selectionFixture,
+      ["--mochajs-project=a"],
+      passed: 4,
+      failed: 1,
+      messages: ["suite other failed", "excluded file ran"],
+    )
+  }
+
+  """
+  One selected test runs alone, in one Mocha run: the other tests of its file
+  pass the --grep by, so a failing one does not fail it.
+  """
+  selectedSingleTestCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withNewFile(
+      "a/test/x.test.js",
+      suiteFile("  it(\"foo\", () => {});\n  it(\"bar\", () => { assert.fail(\"unselected test ran\"); });\n"),
+    )
+    let args = ["--mochajs-project=a", "--mochajs-test-file=test/x.test.js", "--mochajs-test=suite foo"]
+    selectedCheck(ws, fixture, args, passed: 1)
+    let output = selectedOutput(ws, fixture, ["--progress=plain", "-vvv"] + args)
+    let runs = mochaRuns(output)
+    assert(runs.length == 1, "Mocha ran " + toString(runs.length) + " times for one test")
+    let commands = output.split("\n").filter { line =>
+      line.contains("withExec sh /dagger-mocha/timeout.sh") and line.contains("report.json")
+    }
+    assert(
+      commands.all { line => line.contains("--grep '^(?:(?:suite foo)$)'") and line.contains("test/y.test.js") == false },
+      "the run was not narrowed to the test:\n" + commands.join("\n"),
+    )
+    null
+  }
+
+  """
+  A failing test fails its own check and no other.
+  """
+  selectedFailureCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withNewFile(
+      "a/test/x.test.js",
+      suiteFile("  it(\"foo\", () => { assert.fail(\"selected failure\"); });\n  it(\"bar\", () => {});\n"),
+    )
+    selectedCheck(ws, fixture, selectionArgs, passed: 7, failed: 1, messages: ["suite foo failed", "selected failure"])
+  }
+
+  """
+  A test made in a forEach callback is under "*": its failure fails "*" and
+  no named test. With "*" not selected it does not run.
+  """
+  selectedForEachCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withNewFile(
+      "a/test/x.test.js",
+      suiteFile(passingTests + "  [\"g1\", \"g2\"].forEach((n) => {\n    it(\"gen \" + n, () => { if (n === \"g2\") assert.fail(\"generated failure\"); });\n  });\n"),
+    )
+    selectedCheck(
+      ws,
+      fixture,
+      selectionArgs,
+      passed: 8,
+      failed: 1,
+      messages: ["unnamed tests of test/x.test.js failed", "generated failure"],
+    )
+    selectedCheck(ws, fixture, selectionArgs + ["--mochajs-test=suite foo", "--mochajs-test=suite bar"], passed: 8)
+  }
+
+  """
+  A test a helper function defines is not keyed by its literal title, which
+  its caller may change; it is under "*".
+  """
+  selectedHelperCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withNewFile(
+      "a/test/x.test.js",
+      "const assert = require(\"node:assert\");\n"
+        + "function helper() { it(\"bar\", () => { assert.fail(\"helper failure\"); }); }\n"
+        + "describe(\"suite\", () => {\n  it(\"foo\", () => {});\n  helper();\n});\n",
+    )
+    selectedCheck(
+      ws,
+      fixture,
+      selectionArgs,
+      passed: 7,
+      failed: 1,
+      messages: ["unnamed tests of test/x.test.js failed", "helper failure"],
+    )
+    let output = selectedOutput(ws, fixture, ["-l", "--all", "--mochajs-project=a", "--mochajs-test-file=test/x.test.js"])
+    let rows = listedRows(output)
+    assert(
+      rows == ["a|test/x.test.js|*", "a|test/x.test.js|suite foo"] or rows == ["a|test/x.test.js|suite foo", "a|test/x.test.js|*"],
+      "helper keys:\n" + rows.join("\n"),
+    )
+    null
+  }
+
+  """
+  Nested suites join their titles into the test's full title.
+  """
+  selectedNestedCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withNewFile(
+      "a/test/x.test.js",
+      "const assert = require(\"node:assert\");\n"
+        + "describe(\"outer\", () => {\n  describe(\"inner\", () => {\n    it(\"deep\", () => { assert.fail(\"nested failure\"); });\n  });\n  it(\"shallow\", () => {});\n});\n",
+    )
+    selectedCheck(
+      ws,
+      fixture,
+      ["--mochajs-project=a", "--mochajs-test=outer inner deep", "--mochajs-test=outer shallow"],
+      passed: 1,
+      failed: 1,
+      messages: ["outer inner deep failed", "nested failure"],
+    )
+  }
+
+  """
+  The tdd interface, set in the config, names suite and test.
+  """
+  selectedTddCheck(ws: Workspace!): Void @check {
+    let fixture = directory
+      .withNewFile("tdd/package.json", packageJson("commonjs", "^11.7.5", ""))
+      .withNewFile("tdd/.mocharc.yml", "spec: test/*.test.js\nui: tdd\n")
+      .withNewFile(
+        "tdd/test/x.test.js",
+        "const assert = require(\"node:assert\");\nsuite(\"tsuite\", function () {\n  test(\"one\", function () {});\n  test(\"two\", function () { assert.fail(\"tdd failure\"); });\n});\n",
+      )
+    selectedCheck(ws, fixture, [], passed: 1, failed: 1, messages: ["tsuite two failed", "tdd failure"])
+  }
+
+  """
+  A failing hook fails the selected tests under its suite.
+  """
+  selectedHookFailureCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withNewFile(
+      "b/test/y.test.js",
+      suiteFile("  before(() => { throw new Error(\"setup failure\"); });\n" + passingTests),
+    )
+    selectedCheck(
+      ws,
+      fixture,
+      selectionArgs,
+      passed: 6,
+      failed: 2,
+      messages: ["suite foo failed", "setup failure"],
+    )
+  }
+
+  """
+  A file that throws while Mocha loads it stops its project's run: that
+  file's checks fail with the reason, the project's other files still pass,
+  and so does the other project.
+  """
+  selectedLoadFailureCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withNewFile(
+      "b/test/x.test.js",
+      "throw new Error(\"load failure\");\n" + suiteFile(passingTests),
+    )
+    selectedCheck(
+      ws,
+      fixture,
+      selectionArgs,
+      passed: 6,
+      failed: 2,
+      messages: ["test/x.test.js failed on its own", "load failure"],
+    )
+  }
+
+  """
+  A JS config's spec reaches a file discovery does not list, which only the
+  whole run of the project runs: its failure belongs to no selected test, so
+  it fails them all.
+  """
+  selectedUnlistedFailureCheck(ws: Workspace!): Void @check {
+    let fixture = selectionProject(directory, "c", ["test/x.test.js", "test/y.test.js"], suiteFile(passingTests))
+      .withoutFile("c/.mocharc.json")
+      .withNewFile("c/.mocharc.cjs", "module.exports = { spec: [\"test/*.test.js\", \"extra/*.js\"] };\n")
+      .withNewFile("c/extra/broken.js", failingTest)
+    selectedCheck(
+      ws,
+      fixture,
+      ["--mochajs-project=c"],
+      passed: 0,
+      failed: 2,
+      messages: ["failures in test files without selected test checks: extra/broken.js"],
+    )
+  }
+
+  """
+  A named test Mocha never runs fails as not run, rather than passing with
+  nothing behind it.
+  """
+  selectedNeverRanCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withNewFile(
+      "a/test/x.test.js",
+      suiteFile("  it(\"foo\", () => {});\n  return;\n  it(\"ghost\", () => {});\n"),
+    )
+    selectedCheck(
+      ws,
+      fixture,
+      selectionArgs,
+      passed: 7,
+      failed: 1,
+      messages: ["suite ghost did not run"],
+    )
+  }
+
+  """
+  A test under an if is not named, as it may not exist: it is under "*",
+  which passes with no unnamed test run, rather than failing as not run.
+  """
+  selectedConditionalCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withNewFile(
+      "a/test/x.test.js",
+      suiteFile(passingTests + "  if (process.env.E2E_NEVER_SET) {\n    it(\"ghost\", () => {});\n  }\n"),
+    )
+    selectedCheck(ws, fixture, selectionArgs, passed: 9)
+  }
+
+  """
+  A .only holds every file of Mocha's run, and Mocha passes the tests it
+  leaves out, so their checks pass too. Under forbidOnly, Mocha throws as it
+  loads the file that calls .only, and that file's checks fail.
+  """
+  selectedOnlyCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withNewFile(
+      "a/test/x.test.js",
+      suiteFile("  it.only(\"foo\", () => {});\n  it(\"bar\", () => { assert.fail(\"left out by only\"); });\n"),
+    )
+    selectedCheck(ws, fixture, selectionArgs, passed: 8)
+    let forbidden = fixture.withNewFile(
+      "a/.mocharc.json",
+      "{\"spec\": \"test/*.test.js\", \"forbidOnly\": true}\n",
+    )
+    # Mocha throws as it loads the file that calls .only, so only that file's
+    # tests fail.
+    selectedCheck(ws, forbidden, selectionArgs, passed: 6, failed: 2, messages: ["forbidden by --forbid-only"])
+  }
+
+  """
+  A project whose test files cannot be found fails alone, naming its config;
+  the other project is unaffected.
+  """
+  selectedDiscoveryFailureCheck(ws: Workspace!): Void @check {
+    let a = selectionProject(directory, "a", ["test/x.test.js"], suiteFile(passingTests))
+    let fixture = selectionProject(a, "b", ["test/x.test.js"], suiteFile(passingTests))
+      .withNewFile("b/.mocharc.json", "{\"spec\": }\n")
+    selectedCheck(
+      ws,
+      fixture,
+      [],
+      passed: 2,
+      failed: 1,
+      messages: ["cannot read b/.mocharc.json"],
+    )
+  }
+
+  """
+  Every selected test of a project shares one Mocha run: eight checks over
+  two projects run Mocha twice, once per project.
+  """
+  selectedDedupCheck(ws: Workspace!): Void @check {
+    let output = selectedOutput(ws, selectionFixture, ["--progress=plain", "-vvv"] + selectionArgs)
+    let runs = mochaRuns(output)
+    assert(
+      runs.length == 2,
+      "Mocha ran " + toString(runs.length) + " times for 2 projects:\n" + output.split("\n").takeLast(80).join("\n"),
+    )
+    null
+  }
+
+  """
+  The output of a dagger check run that must pass.
+  """
+  let selectedOutput(ws: Workspace!, fixture: Directory!, args: [String!]!): String! {
+    let result = selectedRun(ws, fixture, args)
+    let output = result.stdout + result.stderr
+    assert(result.exitCode == 0, "dagger check " + args.join(" ") + " failed:\n" + output)
+    output
+  }
+
+  """
+  The ids of the spans that ran a project's shared Mocha run. Plain progress
+  prints each span's id before its name; a run cached for another check is no
+  span of its own.
+  """
+  let mochaRuns(output: String!): [String!]! {
+    output
+      .split("\n")
+      .filter { line =>
+        line.contains("withExec sh /dagger-mocha/timeout.sh")
+          and line.contains("output=/dagger-mocha/report.json")
+      }
+      .map { line => line.split(":").takeFirst(1).join("").trimSpace }
+      .uniq
+  }
+
+  """
+  The rows dagger check -l lists for this module, as project|file|test.
+  """
+  let listedRows(output: String!): [String!]! {
+    output
+      .split("\n")
+      .filter { line => line.hasPrefix("mochajs ") }
+      .map { line => line.replaceMatches(`\s{2,}`, with: "|").split("|").takeFirst(4).dropFirst(1).join("|") }
+  }
+
+  """
+  Listing runs no tool: with a project whose install fails and one whose
+  Mocha config does not parse, every test is still listed, and nothing is
+  installed and no Mocha runs.
+  """
+  selectedListingCheck(ws: Workspace!): Void @check {
+    let fixture = selectionFixture
+      .withNewFile(
+        "a/package.json",
+        packageJson("commonjs", "^11.7.5", ", \"scripts\": {\"postinstall\": \"exit 3\"}"),
+      )
+      .withNewFile("b/.mocharc.json", "{\"spec\": }\n")
+    let output = selectedOutput(ws, fixture, ["--progress=plain", "-vvv", "-l", "--all"])
+    let rows = listedRows(output)
+    let want = [
+      "a|test/x.test.js|suite foo",
+      "a|test/x.test.js|suite bar",
+      "a|test/y.test.js|suite foo",
+      "a|test/y.test.js|suite bar",
+      "a|test/z.test.js|suite other",
+      "b|.mocharc.json|*",
+    ]
+    assert(
+      rows.length == want.length and want.all { key => rows.contains(key) },
+      "listed rows:\n" + rows.join("\n") + "\n" + output.split("\n").takeLast(40).join("\n"),
+    )
+    let tools = output.split("\n").filter { line =>
+      line.contains("withExec") and (
+        line.contains("npm install") or line.contains("/dagger-mocha/") or line.contains("--dry-run")
+      )
+    }
+    assert(tools.length == 0, "listing ran a tool:\n" + tools.join("\n"))
     null
   }
 }
